@@ -69,7 +69,43 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm windows-rocm windows-cpu
+
+# Native Windows ROCm/HIP build of ds4-bench.exe for gfx1151 (AMD HIP SDK, no
+# WSL). hipcc.exe's .bat wrapper splits args on spaces, so the compile/link is
+# delegated to win/build-rocm.sh (which also synthesizes the MSVC import libs
+# and vendors rocWMMA). Override ROCM_PATH / ROCM_ARCH as needed.
+ROCM_PATH ?= C:/Program Files/AMD/ROCm/7.1
+windows-rocm:
+	ROCM_PATH="$(ROCM_PATH)" ROCM_ARCH="$(ROCM_ARCH)" bash win/build-rocm.sh
+
+# Native Windows CPU-only build of ds4-bench.exe with MinGW-w64 GCC (no GPU
+# backend, no WSL/MSVC). This mirrors the windows-cpu target from the pre-
+# refactor base on top of current main, whose shared CPU core also links
+# ds4_image.c / ds4_tp.c / ds4_layer_pack.c / ds4_gpu_args.c, so those TUs
+# compile and link here too. All Windows portability shims (ds4_win.h,
+# win/ds4_sockets_win.h) are wired in-tree behind _WIN32/__MINGW32__ guards;
+# MinGW already provides pthread/clock_gettime/ftruncate, so the MSVC pthread
+# shim is not used (it is !__MINGW32__-guarded). -lws2_32 / -liphlpapi are
+# explicit because the sockets shim's MSVC `#pragma comment(lib,...)` is a
+# no-op under gcc. Self-contained (sets its own CC/flags) so it builds
+# regardless of the host uname-s branch and leaves the POSIX targets alone.
+WIN_CPU_CC      ?= gcc
+WIN_CPU_CFLAGS  ?= -O3 -ffast-math -march=native -g -Wall -Wextra -std=c99 \
+                   -D_GNU_SOURCE -fno-finite-math-only -DDS4_NO_GPU
+WIN_CPU_LDLIBS  ?= -lm -lpthread -lws2_32 -liphlpapi
+WIN_CPU_OBJS    = ds4_cpu.o ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o ds4_image.o ds4_tp.o ds4_distributed.o ds4_ssd.o ds4_layer_pack.o
+windows-cpu:
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -Wno-unused-function -c -o ds4_cpu.o ds4.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_bench_cpu.o ds4_bench.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_help.o ds4_help.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_gpu_args_cpu.o ds4_gpu_args.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_image.o ds4_image.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_tp.o ds4_tp.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_distributed.o ds4_distributed.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_ssd.o ds4_ssd.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_layer_pack.o ds4_layer_pack.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -o ds4-bench.exe $(WIN_CPU_OBJS) $(WIN_CPU_LDLIBS)
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
@@ -1065,6 +1101,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f ds4-bench.exe ds4.exe ds4-server.exe ds4-eval.exe ds4-agent.exe
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery

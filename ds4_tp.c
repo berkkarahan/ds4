@@ -9,22 +9,45 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <netdb.h>
 #include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#if defined(_WIN32)
+/* Native Windows build: main moved the tensor-parallel transport into CORE_OBJS
+ * too, so it links into ds4-bench. The POSIX sockets/iovec surface it uses is
+ * supplied by the Winsock2 shim plus its sendmsg/recvmsg emulation; the POSIX
+ * shim (ds4_win.h) covers clock_gettime/etc. Both bodies are guarded by
+ * _WIN32, so POSIX builds are byte-for-byte unchanged. */
+#include "win/ds4_sockets_win.h"
+#if defined(DS4_WIN_PTHREAD)
+#include "win/ds4_pthread_win.h"
+#else
+#include <pthread.h>
+#endif
+#if defined(__MINGW32__)
+/* MinGW supplies sleep()/usleep()/getpid via <unistd.h>; the MSVC ABI build
+ * relies on the shims and <process.h> instead. */
+#include <unistd.h>
+#else
+#include <io.h>              /* MSVC-ABI build: _open/_read/_write/_close */
+#include <process.h>         /* getpid */
+#endif
+#include "ds4_win.h"
+#else
+#include <netdb.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <poll.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 #include "ds4_tp.h"
 #include "ds4_gpu.h"

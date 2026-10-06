@@ -77,6 +77,11 @@
 /tests/test_engram
 *.o
 *.dSYM/
+*.exe
+# Generated MSVC import libs for the Windows ROCm build (regenerated from the
+# HIP SDK's lib*.dll by win/build-rocm.sh).
+/win/third_party/hipblas.lib
+/win/third_party/hipblaslt.lib
 __pycache__/
 *.pyc
 /gguf-tools/libds4quants.dylib
@@ -84,6 +89,7 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+ds4.lock
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
