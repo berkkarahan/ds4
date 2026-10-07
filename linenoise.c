@@ -103,18 +103,23 @@
  *
  */
 
+#ifdef _WIN32
+#include "win/ds4_frontend_win.h"
+#else
 #include <termios.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#endif
 #include <stdint.h>
 #include "linenoise.h"
 

@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "win/ds4_frontend_win.h"
+#endif
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -26,7 +29,9 @@
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 static bool cli_env_flag_enabled(const char *name, bool defval) {
     const char *v = getenv(name);
@@ -1318,8 +1323,12 @@ static bool parse_steering_level(const char *arg, float *out) {
 }
 
 static void history_file_path(char *buf, size_t len) {
+#ifdef _WIN32
+    const char *home = ds4_fe_home();
+#else
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
+#endif
     snprintf(buf, len, "%s/.ds4_history", home);
 }
 

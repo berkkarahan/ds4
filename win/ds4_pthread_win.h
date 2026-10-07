@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
 
 /* ---- threads ------------------------------------------------------------- */
 typedef struct {
@@ -136,24 +137,77 @@ static inline int pthread_equal(pthread_t a, pthread_t b)
     return aid == bid;
 }
 
-/* ---- mutex (non-recursive; matches PTHREAD default) ---------------------- */
-typedef SRWLOCK pthread_mutex_t;
-#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+/* ---- mutex ---------------------------------------------------------------
+ * Default mutexes are non-recursive SRW locks, including the static
+ * initializer used by the engine. A mutex created with
+ * PTHREAD_MUTEX_RECURSIVE tracks the owning thread so the server can re-enter
+ * its inference lock. Condition waits always sleep on the SRW itself, so a
+ * recursive mutex must be held exactly once across pthread_cond_wait. */
+typedef struct ds4_pthread_mutex {
+    SRWLOCK lock;
+    DWORD owner;
+    LONG depth;
+    int recursive;
+} pthread_mutex_t;
+#define PTHREAD_MUTEX_INITIALIZER {SRWLOCK_INIT, 0, 0, 0}
+#define PTHREAD_MUTEX_NORMAL 0
+#define PTHREAD_MUTEX_RECURSIVE 1
+
+typedef struct ds4_pthread_mutexattr {
+    int type;
+} pthread_mutexattr_t;
+
+static inline int pthread_mutexattr_init(pthread_mutexattr_t *a)
+{
+    if (!a) return EINVAL;
+    a->type = PTHREAD_MUTEX_NORMAL;
+    return 0;
+}
+static inline int pthread_mutexattr_destroy(pthread_mutexattr_t *a)
+{
+    (void)a;
+    return 0;
+}
+static inline int pthread_mutexattr_settype(pthread_mutexattr_t *a, int type)
+{
+    if (!a) return EINVAL;
+    a->type = type;
+    return 0;
+}
 
 static inline int pthread_mutex_init(pthread_mutex_t *m, const void *attr)
 {
-    (void)attr;
-    InitializeSRWLock(m);
+    const pthread_mutexattr_t *a = (const pthread_mutexattr_t *)attr;
+    InitializeSRWLock(&m->lock);
+    m->owner = 0;
+    m->depth = 0;
+    m->recursive = a && a->type == PTHREAD_MUTEX_RECURSIVE;
     return 0;
 }
 static inline int pthread_mutex_lock(pthread_mutex_t *m)
 {
-    AcquireSRWLockExclusive(m);
+    if (m->recursive) {
+        DWORD tid = GetCurrentThreadId();
+        if (m->owner == tid) {
+            m->depth++;
+            return 0;
+        }
+        AcquireSRWLockExclusive(&m->lock);
+        m->owner = tid;
+        m->depth = 1;
+        return 0;
+    }
+    AcquireSRWLockExclusive(&m->lock);
     return 0;
 }
 static inline int pthread_mutex_unlock(pthread_mutex_t *m)
 {
-    ReleaseSRWLockExclusive(m);
+    if (m->recursive) {
+        if (m->owner != GetCurrentThreadId() || m->depth <= 0) return EPERM;
+        if (--m->depth > 0) return 0;
+        m->owner = 0;
+    }
+    ReleaseSRWLockExclusive(&m->lock);
     return 0;
 }
 static inline int pthread_mutex_destroy(pthread_mutex_t *m)
@@ -175,7 +229,29 @@ static inline int pthread_cond_init(pthread_cond_t *c, const void *attr)
 static inline int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m)
 {
     /* SRWLOCK held exclusively → CONDITION_VARIABLE_LOCKMODE default (0). */
-    return SleepConditionVariableSRW(c, m, INFINITE, 0) ? 0 : EINVAL;
+    return SleepConditionVariableSRW(c, &m->lock, INFINITE, 0) ? 0 : EINVAL;
+}
+/* Absolute CLOCK_REALTIME deadline, matching ds4_win.h clock_gettime. */
+#ifndef ETIMEDOUT
+#define ETIMEDOUT 138
+#endif
+static inline int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
+                                         const struct timespec *abs)
+{
+    if (!abs) return EINVAL;
+    FILETIME ft;
+    ULARGE_INTEGER ticks;
+    GetSystemTimeAsFileTime(&ft);
+    ticks.LowPart = ft.dwLowDateTime;
+    ticks.HighPart = ft.dwHighDateTime;
+    const uint64_t unix_ticks = ticks.QuadPart - 116444736000000000ULL;
+    const int64_t now_ms = (int64_t)(unix_ticks / 10000ULL);
+    const int64_t abs_ms = (int64_t)abs->tv_sec * 1000 + abs->tv_nsec / 1000000L;
+    int64_t wait_ms = abs_ms - now_ms;
+    if (wait_ms <= 0) return ETIMEDOUT;
+    if (wait_ms > 0x7fffffff) wait_ms = 0x7fffffff;
+    if (SleepConditionVariableSRW(c, &m->lock, (DWORD)wait_ms, 0)) return 0;
+    return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : EINVAL;
 }
 static inline int pthread_cond_signal(pthread_cond_t *c)
 {

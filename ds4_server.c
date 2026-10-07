@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "win/ds4_frontend_win.h"
+#endif
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
@@ -15,31 +18,33 @@
  * serializes bounded prefill quanta, keeping graph mutations out of client
  * threads while preserving per-session KV ownership. */
 
-#include <arpa/inet.h>
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <float.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;

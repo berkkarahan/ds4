@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "win/ds4_frontend_win.h"
+#endif
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
@@ -11,32 +14,34 @@
 
 #include <errno.h>
 #include <ctype.h>
-#include <dirent.h>
-#include <fnmatch.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
-#include <poll.h>
-#include <pthread.h>
-#include <regex.h>
-#include <signal.h>
-#include <spawn.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <fnmatch.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <regex.h>
+#include <signal.h>
+#include <spawn.h>
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <copyfile.h>
 #elif defined(__linux__)
 #include <sys/xattr.h>
+#endif
 #endif
 
 extern char **environ;
@@ -4683,13 +4688,25 @@ static bool agent_mkdir_p(const char *path) {
     if (!path || !path[0]) return false;
     char *tmp = xstrdup(path);
     for (char *p = tmp + 1; *p; p++) {
+#ifdef _WIN32
+        if (*p != '/' && *p != '\\') continue;
+#else
         if (*p != '/') continue;
+#endif
+        char sep = *p;
         *p = '\0';
         if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+#ifdef _WIN32
+            if (!(strlen(tmp) == 2 && tmp[1] == ':')) {
+                free(tmp);
+                return false;
+            }
+#else
             free(tmp);
             return false;
+#endif
         }
-        *p = '/';
+        *p = sep;
     }
     bool ok = mkdir(tmp, 0700) == 0 || errno == EEXIST;
     free(tmp);
@@ -4697,8 +4714,12 @@ static bool agent_mkdir_p(const char *path) {
 }
 
 static char *agent_default_cache_dir(void) {
+#ifdef _WIN32
+    const char *home = ds4_fe_home();
+#else
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
+#endif
     agent_buf b = {0};
     agent_buf_puts(&b, home);
     if (b.len == 0 || b.ptr[b.len - 1] != '/') agent_buf_puts(&b, "/");
@@ -7054,14 +7075,23 @@ static bool agent_same_file_version(const struct stat *a, const struct stat *b) 
 #ifdef __APPLE__
     struct timespec am = a->st_mtimespec, bm = b->st_mtimespec;
     struct timespec ac = a->st_ctimespec, bc = b->st_ctimespec;
-#else
-    struct timespec am = a->st_mtim, bm = b->st_mtim;
-    struct timespec ac = a->st_ctim, bc = b->st_ctim;
-#endif
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
            a->st_size == b->st_size && a->st_nlink == b->st_nlink &&
            am.tv_sec == bm.tv_sec && am.tv_nsec == bm.tv_nsec &&
            ac.tv_sec == bc.tv_sec && ac.tv_nsec == bc.tv_nsec;
+#elif defined(_WIN32)
+    /* _stat64 exposes whole-second stamps, not timespec fields. */
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_size == b->st_size && a->st_nlink == b->st_nlink &&
+           a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
+#else
+    struct timespec am = a->st_mtim, bm = b->st_mtim;
+    struct timespec ac = a->st_ctim, bc = b->st_ctim;
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_size == b->st_size && a->st_nlink == b->st_nlink &&
+           am.tv_sec == bm.tv_sec && am.tv_nsec == bm.tv_nsec &&
+           ac.tv_sec == bc.tv_sec && ac.tv_nsec == bc.tv_nsec;
+#endif
 }
 
 #ifdef __linux__
@@ -8592,7 +8622,16 @@ static bool agent_write_temp_text(const char *prefix, const char *text,
                                   char *path, size_t path_len,
                                   char *err, size_t err_len) {
     char tmpl[PATH_MAX];
+#ifdef _WIN32
+    char name[160];
+    snprintf(name, sizeof(name), "%s_XXXXXX", prefix);
+    if (ds4_win_temp_path(tmpl, sizeof(tmpl), name) != 0) {
+        snprintf(err, err_len, "failed to build temporary path");
+        return false;
+    }
+#else
     snprintf(tmpl, sizeof(tmpl), "/tmp/%s_XXXXXX", prefix);
+#endif
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         snprintf(err, err_len, "failed to create temporary file: %s", strerror(errno));
@@ -8939,6 +8978,123 @@ static void *agent_bash_monitor(void *arg) {
 
 /* Do not fork the inference process: copying its wired, private model mappings
  * can exhaust memory before the child gets to exec, even with copy-on-write. */
+#ifdef _WIN32
+static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
+                            const char *cmd) {
+    (void)tmpfd;
+    char shell[PATH_MAX];
+    int bash = 0;
+    if (ds4_fe_find_shell(shell, sizeof(shell), &bash) != 0) return ENOENT;
+    char script[PATH_MAX];
+    if (ds4_win_temp_path(script, sizeof(script), "ds4_agent_cmd_XXXXXX") != 0)
+        return EIO;
+    int sfd = mkstemp(script);
+    if (sfd < 0) return errno ? errno : EIO;
+    FILE *sf = fdopen(sfd, "wb");
+    if (!sf) {
+        int saved = errno;
+        close(sfd);
+        unlink(script);
+        return saved ? saved : EIO;
+    }
+    if (fputs(cmd ? cmd : "", sf) == EOF || fputc('\n', sf) == EOF) {
+        fclose(sf);
+        unlink(script);
+        return EIO;
+    }
+    fclose(sf);
+
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (nul == INVALID_HANDLE_VALUE) {
+        unlink(script);
+        return EIO;
+    }
+    HANDLE in_h = INVALID_HANDLE_VALUE, out_h = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), nul, GetCurrentProcess(), &in_h,
+                         0, TRUE, DUPLICATE_SAME_ACCESS) ||
+        !DuplicateHandle(GetCurrentProcess(), (HANDLE)_get_osfhandle(pipefd[1]),
+                         GetCurrentProcess(), &out_h, 0, TRUE,
+                         DUPLICATE_SAME_ACCESS)) {
+        if (in_h != INVALID_HANDLE_VALUE) CloseHandle(in_h);
+        CloseHandle(nul);
+        unlink(script);
+        return EIO;
+    }
+    CloseHandle(nul);
+
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    STARTUPINFOEXA si;
+    memset(&si, 0, sizeof(si));
+    si.StartupInfo.cb = sizeof(si);
+    si.lpAttributeList = HeapAlloc(GetProcessHeap(), 0, attr_size);
+    if (!si.lpAttributeList ||
+        !InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size)) {
+        if (si.lpAttributeList) HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        CloseHandle(in_h);
+        CloseHandle(out_h);
+        unlink(script);
+        return EIO;
+    }
+    HANDLE inherit[2] = {in_h, out_h};
+    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0,
+                                   PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherit, sizeof(inherit), NULL, NULL)) {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        CloseHandle(in_h);
+        CloseHandle(out_h);
+        unlink(script);
+        return EIO;
+    }
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = in_h;
+    si.StartupInfo.hStdOutput = out_h;
+    si.StartupInfo.hStdError = out_h;
+
+    char script_fwd[PATH_MAX];
+    snprintf(script_fwd, sizeof(script_fwd), "%s", script);
+    for (char *p = script_fwd; *p; p++) if (*p == '\\') *p = '/';
+    char cmdline[PATH_MAX * 2];
+    if (!bash)
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" /d /s /c \"%s\"", shell, script);
+    else
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" --noprofile --norc \"%s\"",
+                 shell, script_fwd);
+
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+        memset(&info, 0, sizeof(info));
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                &info, sizeof(info));
+    }
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof(pi));
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
+                             CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+                             NULL, NULL, &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(si.lpAttributeList);
+    HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+    CloseHandle(in_h);
+    CloseHandle(out_h);
+    if (!ok) {
+        if (job) CloseHandle(job);
+        unlink(script);
+        return (int)GetLastError();
+    }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    *pid = (pid_t)pi.dwProcessId;
+    ds4_fe_track_process(*pid, pi.hProcess, job);
+    return 0;
+}
+#else
 static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
                             const char *cmd) {
     posix_spawnattr_t attr;
@@ -8966,12 +9122,22 @@ static int agent_bash_spawn(pid_t *pid, int tmpfd, const int pipefd[2],
     posix_spawnattr_destroy(&attr);
     return rc;
 }
+#endif
 
 /* Spawn a shell command into its own process group so bash_stop/timeout can
  * kill grandchildren created by the shell, not just the /bin/sh wrapper. */
 static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len) {
+#ifdef _WIN32
+    char tmp_path[PATH_MAX];
+    if (ds4_win_temp_path(tmp_path, sizeof(tmp_path),
+                          "ds4_agent_output_XXXXXX") != 0) {
+        snprintf(err, err_len, "failed to build temporary output path");
+        return NULL;
+    }
+#else
     char tmp_path[] = "/tmp/ds4_agent_output_XXXXXX";
+#endif
     int tmpfd = mkstemp(tmp_path);
     if (tmpfd < 0) {
         snprintf(err, err_len, "failed to create temporary output file: %s", strerror(errno));

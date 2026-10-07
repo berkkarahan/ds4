@@ -1,8 +1,9 @@
 # Native Windows builds
 
-The native Windows port builds **`ds4-bench.exe`**, using MinGW for CPU
-reference work or AMD HIP/ROCm for GPU inference. The CLI and HTTP server
-are not Windows targets yet.
+The native Windows port builds `ds4.exe`, `ds4-server.exe`, `ds4-agent.exe`,
+and `ds4-bench.exe`. MinGW produces the CPU binaries. AMD HIP/ROCm produces
+the GPU binaries. Both targets write those four executables; the last build
+selects the backend of the copies at the repository root.
 
 On Windows 11 with ROCm 7.2, the RX 9070 XT (`gfx1201`, 15.92 GiB VRAM)
 successfully runs the official DeepSeek V4 Flash Q2 GGUF with SSD streaming.
@@ -32,9 +33,12 @@ make windows-rocm
 make windows-cpu
 ```
 
-Both commands default to `ds4-bench.exe`; the last build selects its backend.
-Objects are separate under `win/build/rocm` and `win/build/cpu`. To keep a CPU
-binary alongside the GPU binary:
+Both commands build `ds4.exe`, `ds4-server.exe`, `ds4-agent.exe`, and
+`ds4-bench.exe`. Objects are separate under `win/build/rocm` and
+`win/build/cpu`. The default `WIN_CPU_OUTPUT` is `ds4-bench.exe` at the
+repository root, and the other three CPU binaries are written beside it, so
+a later `windows-rocm` build replaces all four. To keep the CPU binaries
+alongside the GPU binaries:
 
 ```sh
 make windows-cpu WIN_CPU_OUTPUT=win/build/cpu/ds4-bench.exe
@@ -75,6 +79,29 @@ export HIP_VISIBLE_DEVICES=0   # verify this is the intended GPU with hipInfo.ex
 continuation of each selected prefix. Omit `--ssd-streaming-cold` for normal
 expert-cache preloading. The validation report includes a full chat-prompt test
 as well as this benchmark.
+
+The same ROCm runtime serves one-shot CLI prompts and the HTTP API. Keep the
+context small for a smoke test; the model still streams from SSD:
+
+```sh
+./ds4.exe --rocm -m "gguf/$MODEL" --nothink -n 8 -c 2048 -p "Say hi" \
+  --ssd-streaming --ssd-streaming-cache-experts 512
+
+./ds4-server.exe --rocm -m "gguf/$MODEL" --host 127.0.0.1 --port 8000 \
+  -n 8 -c 2048 --ssd-streaming --ssd-streaming-cache-experts 512
+```
+
+A chat completion with `"model": "deepseek-chat"` disables thinking. The agent
+runs one turn without the TUI:
+
+```sh
+./ds4-agent.exe --rocm -m "gguf/$MODEL" --non-interactive --nothink \
+  -n 16 -c 8192 -p "Say hi" --ssd-streaming --ssd-streaming-cache-experts 512
+```
+
+Tool shells prefer Git Bash. Set `DS4_SHELL` to an explicit `bash.exe` when it
+is not on `PATH`. The agent writes the command to a temporary script and does
+not duplicate the model mapping into that process.
 
 Select the intended GPU with `HIP_VISIBLE_DEVICES` on mixed-GPU machines.
 The test launcher defaults to device 0 and respects an explicit override.
@@ -156,9 +183,8 @@ batched prefill and snapshot replay.
 
 ## Scope and remaining work
 
-Distributed/TP serving on Windows remains unvalidated. The socket shim has
-known gaps, including POSIX error translation, per-call nonblocking semantics,
-socket-handle width, and Winsock initialization lifetime. Its presence lets the
-shared core link; it is not evidence of complete distributed-runtime support.
-The CLI requires a Windows console port, and the server needs a broader socket
-audit. Linux ROCm, CUDA, and Metal runtime tests require their respective hosts.
+`ds4-server.exe` serves the local HTTP API on one GPU. Distributed/TP serving
+on Windows remains unvalidated. The socket shim has known gaps, including
+POSIX error translation, per-call nonblocking semantics, socket-handle width,
+and Winsock initialization lifetime. Linux ROCm, CUDA, and Metal runtime tests
+require their respective hosts.

@@ -393,6 +393,9 @@ static inline int flock(int fd, int op)
     return 0;
 }
 
+/* Frontends supply a richer fcntl (nonblocking, F_DUPFD). The bench keeps this
+ * one: it only clears the inherit bit for the instance lock. */
+#ifndef DS4_WIN_NO_FCNTL
 static inline int fcntl(int fd, int cmd, ...)
 {
     if (cmd != F_SETFD) { errno = ENOTSUP; return -1; }
@@ -408,6 +411,7 @@ static inline int fcntl(int fd, int cmd, ...)
     }
     return 0;
 }
+#endif /* !DS4_WIN_NO_FCNTL */
 
 static inline long long ds4_pread(int fd, void *buf, size_t count, long long offset)
 {

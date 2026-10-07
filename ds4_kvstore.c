@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "win/ds4_frontend_win.h"
+#endif
 #include "ds4_kvstore.h"
 
 /* Shared disk KV checkpoint file support.
@@ -10,17 +13,19 @@
  * still live with the protocol code that owns those mappings. */
 
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'
@@ -356,13 +361,25 @@ static bool kv_mkdir_p(const char *path) {
     if (!path || !path[0]) return false;
     char *tmp = kv_xstrdup(path);
     for (char *p = tmp + 1; *p; p++) {
+#ifdef _WIN32
+        if (*p != '/' && *p != '\\') continue;
+#else
         if (*p != '/') continue;
+#endif
+        char sep = *p;
         *p = '\0';
         if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+#ifdef _WIN32
+            if (!(strlen(tmp) == 2 && tmp[1] == ':')) {
+                free(tmp);
+                return false;
+            }
+#else
             free(tmp);
             return false;
+#endif
         }
-        *p = '/';
+        *p = sep;
     }
     bool ok = mkdir(tmp, 0700) == 0 || errno == EEXIST;
     free(tmp);
@@ -883,7 +900,7 @@ static bool kv_trailer_write(const ds4_kvstore_trailer_hooks *hooks,
                              uint64_t *written_bytes) {
     if (written_bytes) *written_bytes = 0;
     if (!hooks || !hooks->write) return true;
-    return hooks->write(hooks->ud, fp, text, written_bytes);
+    return (hooks->write)(hooks->ud, fp, text, written_bytes);
 }
 
 static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,

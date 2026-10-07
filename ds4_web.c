@@ -1,26 +1,31 @@
+#ifdef _WIN32
+#include "win/ds4_frontend_win.h"
+#endif
 #include "ds4_web.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <netdb.h>
-#include <poll.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <signal.h>
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -158,10 +163,21 @@ static bool web_mkdir_p(const char *path) {
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p; p++) {
+#ifdef _WIN32
+        if (*p != '/' && *p != '\\') continue;
+#else
         if (*p != '/') continue;
+#endif
+        char sep = *p;
         *p = '\0';
-        if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return false;
-        *p = '/';
+        if (mkdir(tmp, 0700) != 0 && errno != EEXIST) {
+#ifdef _WIN32
+            if (!(strlen(tmp) == 2 && tmp[1] == ':')) return false;
+#else
+            return false;
+#endif
+        }
+        *p = sep;
     }
     return mkdir(tmp, 0700) == 0 || errno == EEXIST;
 }
@@ -198,7 +214,7 @@ static int web_tcp_connect(const char *host, int port, int timeout_ms,
             if (rc > 0) {
                 int soerr = 0;
                 socklen_t slen = sizeof(soerr);
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &slen);
                 if (soerr == 0) {
                     if (flags >= 0) fcntl(fd, F_SETFL, flags);
                     break;
@@ -963,6 +979,21 @@ static bool web_scroll_dynamic_page(cdp_ws *ws, char *err, size_t err_len) {
 static char *web_chrome_executable(void) {
     const char *env = getenv("DS4_CHROME");
     if (env && env[0]) return web_xstrdup(env);
+#ifdef _WIN32
+    const char *roots[] = {
+        getenv("PROGRAMFILES"),
+        getenv("PROGRAMFILES(X86)"),
+        getenv("LOCALAPPDATA"),
+        NULL
+    };
+    for (int i = 0; roots[i]; i++) {
+        if (!roots[i][0]) continue;
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate),
+                 "%s\\Google\\Chrome\\Application\\chrome.exe", roots[i]);
+        if (access(candidate, F_OK) == 0) return web_xstrdup(candidate);
+    }
+#endif
 #ifdef __APPLE__
     if (access("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", X_OK) == 0)
         return web_xstrdup("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
@@ -983,20 +1014,33 @@ static char *web_chrome_executable(void) {
     }
 
     const char *names[] = {
+#ifdef _WIN32
+        "chrome.exe",
+        "msedge.exe",
+#else
         "google-chrome",
         "google-chrome-stable",
         "chromium",
         "chromium-browser",
+#endif
         NULL
     };
     const char *pathenv = getenv("PATH");
     if (pathenv) {
         char *path = web_xstrdup(pathenv);
         char *save = NULL;
-        for (char *dir = strtok_r(path, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+#ifdef _WIN32
+        const char *sep = ";";
+        const char *slash = "\\";
+#else
+        const char *sep = ":";
+        const char *slash = "/";
+#endif
+        for (char *dir = strtok_r(path, sep, &save); dir; dir = strtok_r(NULL, sep, &save)) {
             for (int i = 0; names[i]; i++) {
                 char candidate[PATH_MAX];
-                snprintf(candidate, sizeof(candidate), "%s/%s", dir[0] ? dir : ".", names[i]);
+                snprintf(candidate, sizeof(candidate), "%s%s%s",
+                         dir[0] ? dir : ".", slash, names[i]);
                 if (access(candidate, X_OK) == 0) {
                     char *res = web_xstrdup(candidate);
                     free(path);
@@ -1036,6 +1080,35 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     char port_arg[64], profile_arg[PATH_MAX + 64];
     snprintf(port_arg, sizeof(port_arg), "--remote-debugging-port=%d", web->port);
     snprintf(profile_arg, sizeof(profile_arg), "--user-data-dir=%s", web->profile_dir);
+#ifdef _WIN32
+    char cmdline[PATH_MAX * 4];
+    snprintf(cmdline, sizeof(cmdline),
+             "\"%s\" %s --remote-allow-origins=* \"%s\" --no-first-run "
+             "--no-default-browser-check --disable-sync --mute-audio about:blank",
+             exe, port_arg, profile_arg);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    si.hStdInput = si.hStdOutput = si.hStdError = nul;
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                             NULL, NULL, &si, &pi);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    free(exe);
+    if (!ok) {
+        web_set_err(err, err_len, "failed to start Chrome");
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    pid_t pid = (pid_t)pi.dwProcessId;
+    ds4_fe_track_process(pid, pi.hProcess, NULL);
+#else
     pid_t pid = fork();
     if (pid < 0) {
         web_set_err(err, err_len, "failed to fork Chrome: %s", strerror(errno));
@@ -1078,6 +1151,7 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
         _exit(127);
     }
     free(exe);
+#endif
     web->chrome_pid = pid;
     for (int i = 0; i < 80; i++) {
         if (web_set_cancel_err(web, err, err_len)) return false;
@@ -1393,9 +1467,14 @@ static char *web_run_page_js(ds4_web *web, const char *url, const char *js,
 ds4_web *ds4_web_create(const ds4_web_config *cfg) {
     ds4_web *web = web_xmalloc(sizeof(*web));
     memset(web, 0, sizeof(*web));
+#ifdef _WIN32
+    const char *home = cfg && cfg->home_dir && cfg->home_dir[0] ?
+        cfg->home_dir : ds4_fe_home();
+#else
     const char *home = cfg && cfg->home_dir && cfg->home_dir[0] ?
         cfg->home_dir : getenv("HOME");
     if (!home || !home[0]) home = ".";
+#endif
     snprintf(web->home, sizeof(web->home), "%s", home);
     snprintf(web->profile_dir, sizeof(web->profile_dir), "%s/.ds4/browser", home);
     web->port = cfg && cfg->port > 0 ? cfg->port : DS4_WEB_DEFAULT_PORT;

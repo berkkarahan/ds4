@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# build-rocm.sh — native Windows ROCm/HIP build of ds4-bench.exe.
+# build-rocm.sh — native Windows ROCm/HIP build.
 #
-# Builds DS4's GPU (HIP) backend natively on Windows with the AMD HIP SDK — no
-# WSL, no MSVC on PATH, no full Visual Studio install required at the command
-# line (hipcc auto-discovers the VS build tools' headers). Defaults to gfx1201
-# (RDNA4, e.g. Radeon RX 9070 XT); pass ROCM_ARCH=gfx1151 for Strix Halo.
-# Produces ds4-bench.exe at the repo root; objects stage under win/build/rocm/.
+# Builds ds4.exe, ds4-server.exe, ds4-agent.exe, and ds4-bench.exe with the
+# AMD HIP SDK. No WSL and no MSVC on PATH. hipcc discovers the VS build tools.
+# Defaults to gfx1201 (RDNA4, e.g. Radeon RX 9070 XT); pass ROCM_ARCH=gfx1151
+# for Strix Halo. Binaries land at the repo root; objects stage under
+# win/build/rocm/.
 #
 # Why a script instead of pure Make: hipcc.exe's .bat wrapper splits arguments
 # on spaces, so paths like "C:/Program Files/AMD/ROCm/7.2" break -I/-L flags.
@@ -152,20 +152,44 @@ for src in cuda/mmq/ds4_ggml_stubs cuda/mmq/ds4_mmq cuda/mmq/quantize cuda/mmq/m
 done
 
 # Host C translation units (MSVC ABI, to match the hipcc-built ds4_rocm.o).
-for src in ds4 ds4_bench ds4_help ds4_distributed ds4_ssd ds4_image ds4_tp ds4_layer_pack ds4_gpu_args; do
+for src in ds4 ds4_bench ds4_help ds4_distributed ds4_ssd ds4_image ds4_tp ds4_layer_pack ds4_gpu_args \
+           ds4_cli ds4_prompt_prefix linenoise ds4_server ds4_kvstore rax ds4_agent ds4_web; do
     echo "==> compiling $src.c (host, MSVC ABI)"
     "$CLANG" $HOSTFLAGS -c "$src.c" -o "$OBJ/$src.o"
 done
+echo "==> compiling win/ds4_regex_win.c (host, MSVC ABI)"
+"$CLANG" $HOSTFLAGS -c win/ds4_regex_win.c -o "$OBJ/ds4_regex_win.o"
+
+CORE_LINK=(
+    "$OBJ/ds4.o" "$OBJ/ds4_distributed.o" "$OBJ/ds4_ssd.o" "$OBJ/ds4_image.o"
+    "$OBJ/ds4_tp.o" "$OBJ/ds4_layer_pack.o" "$OBJ/ds4_gpu_args.o" "$OBJ/ds4_rocm.o"
+    "$OBJ/ds4_rocm_compat.o" "$OBJ/ds4_rocm_unavailable.o" "$OBJ/ds4_ggml_stubs.rocm.o"
+    "$OBJ/ds4_mmq.rocm.o" "$OBJ/quantize.rocm.o" "$OBJ/mmid.rocm.o" "$OBJ/mmvq.rocm.o"
+    "$OBJ/d2r_stubs.rocm.o"
+)
+LINK_LIBS=(-L"$THIRD" -lhipblas -lhipblaslt -lrocblas -lws2_32)
 
 echo "==> linking ds4-bench.exe"
 "$HIPCC" --offload-arch="$ROCM_ARCH" \
-    "$OBJ/ds4_bench.o" "$OBJ/ds4_help.o" "$OBJ/ds4.o" "$OBJ/ds4_distributed.o" \
-    "$OBJ/ds4_ssd.o" "$OBJ/ds4_image.o" "$OBJ/ds4_tp.o" "$OBJ/ds4_layer_pack.o" \
-    "$OBJ/ds4_gpu_args.o" "$OBJ/ds4_rocm.o" "$OBJ/ds4_rocm_compat.o" \
-    "$OBJ/ds4_rocm_unavailable.o" "$OBJ/ds4_ggml_stubs.rocm.o" "$OBJ/ds4_mmq.rocm.o" \
-    "$OBJ/quantize.rocm.o" "$OBJ/mmid.rocm.o" "$OBJ/mmvq.rocm.o" "$OBJ/d2r_stubs.rocm.o" \
-    -o ds4-bench.exe -L"$THIRD" -lhipblas -lhipblaslt -lrocblas -lws2_32
+    "$OBJ/ds4_bench.o" "$OBJ/ds4_help.o" "${CORE_LINK[@]}" \
+    -o ds4-bench.exe "${LINK_LIBS[@]}"
 
-echo "==> done: ds4-bench.exe"
+echo "==> linking ds4.exe"
+"$HIPCC" --offload-arch="$ROCM_ARCH" \
+    "$OBJ/ds4_cli.o" "$OBJ/ds4_help.o" "$OBJ/ds4_prompt_prefix.o" "$OBJ/linenoise.o" \
+    "${CORE_LINK[@]}" -o ds4.exe "${LINK_LIBS[@]}"
+
+echo "==> linking ds4-server.exe"
+"$HIPCC" --offload-arch="$ROCM_ARCH" \
+    "$OBJ/ds4_server.o" "$OBJ/ds4_help.o" "$OBJ/ds4_kvstore.o" "$OBJ/rax.o" \
+    "${CORE_LINK[@]}" -o ds4-server.exe "${LINK_LIBS[@]}"
+
+echo "==> linking ds4-agent.exe"
+"$HIPCC" --offload-arch="$ROCM_ARCH" \
+    "$OBJ/ds4_agent.o" "$OBJ/ds4_help.o" "$OBJ/ds4_prompt_prefix.o" "$OBJ/ds4_web.o" \
+    "$OBJ/ds4_kvstore.o" "$OBJ/linenoise.o" "$OBJ/ds4_regex_win.o" \
+    "${CORE_LINK[@]}" -o ds4-agent.exe "${LINK_LIBS[@]}"
+
+echo "==> done: ds4-bench.exe ds4.exe ds4-server.exe ds4-agent.exe"
 echo "    Run with the SDK bin on PATH, e.g.:"
 echo "      PATH=\"$(cygpath -u "$ROCM_PATH/bin"):\$PATH\" ./ds4-bench.exe --prompt-file FILE -m MODEL.gguf"
