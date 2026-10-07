@@ -75,6 +75,16 @@ export HIP_VISIBLE_DEVICES=0   # verify this is the intended GPU with hipInfo.ex
   --prefill-chunk 32 --gen-tokens 16 --show-output --csv result.csv
 ```
 
+From `cmd.exe`, `win\start-ds4.cmd` and `win\start-ds4-agent.cmd` prepend
+`%ROCM_PATH%\bin` (default `C:\Program Files\AMD\ROCm\7.2\bin`) and start the
+compiled binaries from the repository root. Extra arguments are forwarded.
+`HIP_VISIBLE_DEVICES` is set to `0` when it is unset.
+
+```bat
+win\start-ds4.cmd --model "gguf\DeepSeek V4 Flash.gguf" -n 8 --nothink -p "Say hi"
+win\start-ds4-agent.cmd --model "gguf\DeepSeek V4 Flash.gguf" -n 16 --non-interactive --ssd-streaming
+```
+
 `prompt.txt` must contain at least 32 tokens for this sweep. Generation is a
 continuation of each selected prefix. Omit `--ssd-streaming-cold` for normal
 expert-cache preloading. The validation report includes a full chat-prompt test
