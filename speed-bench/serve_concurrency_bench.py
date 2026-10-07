@@ -322,7 +322,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Concurrent serving benchmark for ds4-server",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", default="qwen3.8-flash-next")
     parser.add_argument("--prompt-file", default="speed-bench/promessi_sposi.txt")
     parser.add_argument("--prompt-tokens", type=int, default=1024,

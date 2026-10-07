@@ -75,14 +75,22 @@ export HIP_VISIBLE_DEVICES=0   # verify this is the intended GPU with hipInfo.ex
   --prefill-chunk 32 --gen-tokens 16 --show-output --csv result.csv
 ```
 
-From `cmd.exe`, `win\start-ds4.cmd` and `win\start-ds4-agent.cmd` prepend
-`%ROCM_PATH%\bin` (default `C:\Program Files\AMD\ROCm\7.2\bin`) and start the
-compiled binaries from the repository root. Extra arguments are forwarded.
-`HIP_VISIBLE_DEVICES` is set to `0` when it is unset.
+From `cmd.exe`, `win\start-ds4.cmd`, `win\start-ds4-agent.cmd`, and
+`win\start-ds4-server.cmd` prepend `%ROCM_PATH%\bin` (default
+`C:\Program Files\AMD\ROCm\7.2\bin`) and start the compiled binaries from the
+repository root. Extra arguments are forwarded. `HIP_VISIBLE_DEVICES` is set
+to `0` when it is unset.
+
+`win\start-ds4-server.cmd` serves `POST /v1/chat/completions` at
+`http://127.0.0.1:18080/v1/chat/completions`. It loads `ds4flash.gguf` with
+ROCm, SSD streaming, a 512-expert cache, and a 32768-token context. Override
+those with `DS4_MODEL`, `DS4_HOST`, `DS4_PORT`, `DS4_CTX`, and
+`DS4_CACHE_EXPERTS`. Arguments after the script name override the value flags.
 
 ```bat
 win\start-ds4.cmd --model "gguf\DeepSeek V4 Flash.gguf" -n 8 --nothink -p "Say hi"
 win\start-ds4-agent.cmd --model "gguf\DeepSeek V4 Flash.gguf" -n 16 --non-interactive --ssd-streaming
+win\start-ds4-server.cmd
 ```
 
 `prompt.txt` must contain at least 32 tokens for this sweep. Generation is a
@@ -97,7 +105,7 @@ context small for a smoke test; the model still streams from SSD:
 ./ds4.exe --rocm -m "gguf/$MODEL" --nothink -n 8 -c 2048 -p "Say hi" \
   --ssd-streaming --ssd-streaming-cache-experts 512
 
-./ds4-server.exe --rocm -m "gguf/$MODEL" --host 127.0.0.1 --port 8000 \
+./ds4-server.exe --rocm -m "gguf/$MODEL" --host 127.0.0.1 --port 18080 \
   -n 8 -c 2048 --ssd-streaming --ssd-streaming-cache-experts 512
 ```
 

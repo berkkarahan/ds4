@@ -8,7 +8,7 @@
 ./ds4-server --ctx 32768
 ```
 
-The default address is `http://127.0.0.1:8000`. Use `--host 0.0.0.0` to listen
+The default address is `http://127.0.0.1:18080`. Use `--host 0.0.0.0` to listen
 on other interfaces. Restrict access to trusted clients; for an Internet-facing
 deployment, put authentication and TLS in front of the server.
 
@@ -33,7 +33,7 @@ The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
 
 ```sh
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Explain Redis streams."}],"stream":true}'
 ```

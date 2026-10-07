@@ -1093,14 +1093,14 @@ clients.
   necessary rebuild and its latency rather than counting a working tool alone
   as proof that prefix matching works.
 - With vision enabled, run `python3 tests/test_server_vision_cache.py --url
-  http://127.0.0.1:8000 --output /tmp/vision-cache-qa` against an otherwise idle
+  http://127.0.0.1:18080 --output /tmp/vision-cache-qa` against an otherwise idle
   server. Repeat for GLM and DeepSeek, with ordinary and batched sessions.
   Appending an image must retain the matching text/image prefix; replaying old
   images must reuse their encoder output. Changed, removed or reordered old
   images must not reuse incompatible KV. Include visible-history replay that
   omits hidden reasoning, concurrent requests, and a roughly 50K-token prefix
   (`--archive-lines 4200 --append-only`, with a sufficiently large `--ctx`).
-- Run `python3 tests/test_server_vision_agent.py --url http://127.0.0.1:8000
+- Run `python3 tests/test_server_vision_agent.py --url http://127.0.0.1:18080
   --pi /path/to/pi --output /tmp/vision-agent-qa` for both vision models. Pi must
   actually read the two images, edit the program and pass the independent
   output checks through Chat Completions, Responses and Anthropic. Image tool
@@ -1113,7 +1113,7 @@ clients.
   completions. Abandoned work must stop at the next backend-safe boundary, and
   a valid request after each cancellation must complete normally.
 - For the repeatable chat-completions cancellation and slot-reuse gate, run
-  `python3 tests/test_server_batching.py --url http://127.0.0.1:8000 --pairs 2
+  `python3 tests/test_server_batching.py --url http://127.0.0.1:18080 --pairs 2
   --workers 4 --case short-sampled --max-tokens 12 --cancel-first 4`. Then run
   at least twelve short four-request waves against the same four-slot server.
   Every pair must remain deterministic and the server must answer `/v1/models`

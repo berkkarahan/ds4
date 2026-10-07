@@ -15575,7 +15575,7 @@ static server_config parse_options(int argc, char **argv) {
             .mtp_margin = 3.0f,
         },
         .host = "127.0.0.1",
-        .port = 8000,
+        .port = 18080,
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,

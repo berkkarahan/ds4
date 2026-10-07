@@ -12,7 +12,7 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent / "vision-fixtures" / "glm53"
 ENDPOINT = os.environ.get(
-    "DS4_VISION_ENDPOINT", "http://127.0.0.1:8000/v1/chat/completions")
+    "DS4_VISION_ENDPOINT", "http://127.0.0.1:18080/v1/chat/completions")
 MODEL = os.environ.get("DS4_VISION_MODEL", "z-ai/glm-5.3-flash")
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OFFICIAL_ZAI = os.environ.get("DS4_VISION_OFFICIAL_ZAI") == "1"

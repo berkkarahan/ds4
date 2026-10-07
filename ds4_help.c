@@ -349,7 +349,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
-    opt(fp, c, "--port N", "Bind port. Default: 8000");
+    opt(fp, c, "--port N", "Bind port. Default: 18080");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
@@ -496,7 +496,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     } else if (topic_is(topic, "runtime")) {
         if (tool == DS4_HELP_SERVER) {
             opt(fp, c, "Metal API", "./ds4-server -m ds4flash.gguf --metal --ctx 100000");
-            opt(fp, c, "quiet API", "./ds4-server --power 60 --host 127.0.0.1 --port 8000");
+            opt(fp, c, "quiet API", "./ds4-server --power 60 --host 127.0.0.1 --port 18080");
         } else if (tool == DS4_HELP_AGENT) {
             opt(fp, c, "agent", "./ds4-agent -m ds4flash.gguf --ctx 100000");
             opt(fp, c, "quiet agent", "./ds4-agent --power 50");
@@ -514,7 +514,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
         opt(fp, c, "steer FFN", "./ds4 -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
     } else if (tool == DS4_HELP_SERVER || topic_is(topic, "api") || topic_is(topic, "kv-cache")) {
         opt(fp, c, "local API", "./ds4-server --ctx 100000 --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192");
-        opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
+        opt(fp, c, "curl", "curl http://127.0.0.1:18080/v1/models");
     } else if (tool == DS4_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
         opt(fp, c, "interactive", "./ds4-agent");
         opt(fp, c, "one shot", "./ds4-agent --non-interactive -p \"Create /tmp/hello.c\"");

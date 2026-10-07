@@ -234,7 +234,7 @@ experts; their full logits need not match. Use model-quality checks as well,
 not only state replay:
 
 ```sh
-python3 tests/test_server_story.py --url http://127.0.0.1:8000 \
+python3 tests/test_server_story.py --url http://127.0.0.1:18080 \
   --model qwen3.8-flash-next --output /tmp/qwen-story
 ```
 

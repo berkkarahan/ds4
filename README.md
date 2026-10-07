@@ -123,7 +123,7 @@ The default model is `ds4flash.gguf`, a link updated by main-model downloads.
 Pass `-m FILE` to choose explicitly. Commands normally run from the repository
 root; use `--chdir /path/to/ds4` when launching elsewhere.
 
-The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
+The server listens at `http://127.0.0.1:18080` by default; see [serving](docs/SERVER.md)
 for API access and multiple sessions.
 
 The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
