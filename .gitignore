@@ -79,9 +79,14 @@
 *.dSYM/
 *.exe
 # Generated MSVC import libs for the Windows ROCm build (regenerated from the
-# HIP SDK's lib*.dll by win/build-rocm.sh).
+# HIP SDK's lib*.dll by win/build-rocm.sh) plus their source-stamp files.
 /win/third_party/hipblas.lib
 /win/third_party/hipblaslt.lib
+/win/third_party/rocblas.lib
+/win/third_party/.*.lib.src
+# Windows build objects (windows-cpu / windows-rocm stage here; ds4-bench.exe
+# itself stays at the repo root and is covered by *.exe).
+/win/build/
 __pycache__/
 *.pyc
 /gguf-tools/libds4quants.dylib

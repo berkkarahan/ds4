@@ -1,6 +1,11 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
 
+# The Windows targets below are declared before the per-OS branches, so pin the
+# default goal explicitly: plain `make` must keep building the host default
+# (the `all` target each branch defines), not the first Windows target parsed.
+.DEFAULT_GOAL := all
+
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
 else
@@ -71,13 +76,16 @@ endif
 
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm windows-rocm windows-cpu
 
-# Native Windows ROCm/HIP build of ds4-bench.exe for gfx1151 (AMD HIP SDK, no
-# WSL). hipcc.exe's .bat wrapper splits args on spaces, so the compile/link is
-# delegated to win/build-rocm.sh (which also synthesizes the MSVC import libs
-# and vendors rocWMMA). Override ROCM_PATH / ROCM_ARCH as needed.
-ROCM_PATH ?= C:/Program Files/AMD/ROCm/7.1
+# Native Windows ROCm/HIP build of ds4-bench.exe (AMD HIP SDK, no WSL).
+# Plain `make windows-rocm` targets gfx1201 (RDNA4, e.g. Radeon RX 9070 XT);
+# pass ROCM_ARCH=gfx1151 (or any AMDGPU target) to build for another device.
+# hipcc.exe's .bat wrapper splits args on spaces, so the compile/link is
+# delegated to win/build-rocm.sh (which also synthesizes the cached MSVC import
+# libs and stages objects under win/build/rocm). Override ROCM_PATH / ROCM_ARCH
+# as needed.
+ROCM_PATH ?= C:/Program Files/AMD/ROCm/7.2
 windows-rocm:
-	ROCM_PATH="$(ROCM_PATH)" ROCM_ARCH="$(ROCM_ARCH)" bash win/build-rocm.sh
+	ROCM_PATH="$(ROCM_PATH)" ROCM_ARCH="$(if $(filter command line environment,$(origin ROCM_ARCH)),$(ROCM_ARCH),gfx1201)" bash win/build-rocm.sh
 
 # Native Windows CPU-only build of ds4-bench.exe with MinGW-w64 GCC (no GPU
 # backend, no WSL/MSVC). This mirrors the windows-cpu target from the pre-
@@ -90,22 +98,39 @@ windows-rocm:
 # explicit because the sockets shim's MSVC `#pragma comment(lib,...)` is a
 # no-op under gcc. Self-contained (sets its own CC/flags) so it builds
 # regardless of the host uname-s branch and leaves the POSIX targets alone.
+# Objects land in win/build/cpu/ so the MinGW/MSVC and POSIX builds cannot
+# clobber each other; only ds4-bench.exe stays at the repo root.
 WIN_CPU_CC      ?= gcc
+WIN_CPU_BUILD   ?= win/build/cpu
+WIN_CPU_OUTPUT  ?= ds4-bench.exe
 WIN_CPU_CFLAGS  ?= -O3 -ffast-math -march=native -g -Wall -Wextra -std=c99 \
                    -D_GNU_SOURCE -fno-finite-math-only -DDS4_NO_GPU
 WIN_CPU_LDLIBS  ?= -lm -lpthread -lws2_32 -liphlpapi
-WIN_CPU_OBJS    = ds4_cpu.o ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o ds4_image.o ds4_tp.o ds4_distributed.o ds4_ssd.o ds4_layer_pack.o
+WIN_CPU_OBJS    = $(WIN_CPU_BUILD)/ds4_cpu.o $(WIN_CPU_BUILD)/ds4_bench_cpu.o \
+                  $(WIN_CPU_BUILD)/ds4_help.o $(WIN_CPU_BUILD)/ds4_gpu_args_cpu.o \
+                  $(WIN_CPU_BUILD)/ds4_image.o $(WIN_CPU_BUILD)/ds4_tp.o \
+                  $(WIN_CPU_BUILD)/ds4_distributed.o $(WIN_CPU_BUILD)/ds4_ssd.o \
+                  $(WIN_CPU_BUILD)/ds4_layer_pack.o
 windows-cpu:
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -Wno-unused-function -c -o ds4_cpu.o ds4.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_bench_cpu.o ds4_bench.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_help.o ds4_help.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_gpu_args_cpu.o ds4_gpu_args.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_image.o ds4_image.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_tp.o ds4_tp.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_distributed.o ds4_distributed.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_ssd.o ds4_ssd.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o ds4_layer_pack.o ds4_layer_pack.c
-	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -o ds4-bench.exe $(WIN_CPU_OBJS) $(WIN_CPU_LDLIBS)
+	mkdir -p $(WIN_CPU_BUILD)
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -Wno-unused-function -c -o $(WIN_CPU_BUILD)/ds4_cpu.o ds4.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_bench_cpu.o ds4_bench.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_help.o ds4_help.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_gpu_args_cpu.o ds4_gpu_args.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_image.o ds4_image.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_tp.o ds4_tp.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_distributed.o ds4_distributed.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_ssd.o ds4_ssd.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -c -o $(WIN_CPU_BUILD)/ds4_layer_pack.o ds4_layer_pack.c
+	$(WIN_CPU_CC) $(WIN_CPU_CFLAGS) -o $(WIN_CPU_OUTPUT) $(WIN_CPU_OBJS) $(WIN_CPU_LDLIBS)
+
+.PHONY: test-windows
+test-windows:
+	mkdir -p win/build/validation
+	$(WIN_CPU_CC) -std=c11 -D_GNU_SOURCE -I. tests/test_windows_compat.c -o win/build/validation/test-windows-mingw.exe
+	./win/build/validation/test-windows-mingw.exe
+	"$(ROCM_PATH)/bin/clang.exe" --target=x86_64-pc-windows-msvc -std=c11 -D_CRT_SECURE_NO_WARNINGS -DDS4_WIN_PTHREAD -I. tests/test_windows_compat.c -o win/build/validation/test-windows-msvc.exe
+	./win/build/validation/test-windows-msvc.exe
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
@@ -324,6 +349,9 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make windows-rocm        Native Windows HIP benchmark (gfx1201 by default)"
+	@echo "  make windows-cpu         Native Windows MinGW benchmark"
+	@echo "  make test-windows        Windows file, snapshot, and thread regressions"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -1101,6 +1129,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -rf win/build
 	rm -f ds4-bench.exe ds4.exe ds4-server.exe ds4-eval.exe ds4-agent.exe
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state

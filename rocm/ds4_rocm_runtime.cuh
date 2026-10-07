@@ -220,6 +220,8 @@ struct cuda_stream_batch_selected_cache {
     const char **missing_up_ptrs_stage;
     uint32_t ptr_stage_capacity;
     ds4_gpu_tensor selected_tensor;
+    char *packed;
+    uint64_t packed_capacity;
 };
 
 struct cuda_stream_layer_expert_cache {
@@ -360,6 +362,66 @@ static uint64_t g_stream_read_profile_gap4m_groups;
 static uint64_t g_stream_read_profile_gap1m_extra;
 static uint64_t g_stream_read_profile_gap4m_extra;
 
+/*
+ * Streaming host-RAM expert tier.
+ *
+ * A process-managed replay cache between the VRAM expert cache and the SSD:
+ * file spans first streamed for single-token (selected) loads are copied here,
+ * and any later miss for the same span is served from process memory instead
+ * of a disk read.  Payloads are byte-exact copies of the file bytes, so the
+ * arithmetic never changes; only the data source does.  Eviction is LRU and
+ * capacity is bounded; the cache is disabled on unified-memory devices where
+ * the VRAM expert cache already lives in system RAM.
+ */
+struct cuda_stream_ram_key {
+    uint64_t offset;
+    uint64_t bytes;
+};
+struct cuda_stream_ram_key_hash {
+    size_t operator()(const cuda_stream_ram_key &k) const {
+        uint64_t h = k.offset * 0x9e3779b97f4a7c15ull;
+        h ^= k.bytes + 0x517cc1b727220a95ull + (h << 6) + (h >> 2);
+        return (size_t)h;
+    }
+};
+struct cuda_stream_ram_key_eq {
+    bool operator()(const cuda_stream_ram_key &a,
+                    const cuda_stream_ram_key &b) const {
+        return a.offset == b.offset && a.bytes == b.bytes;
+    }
+};
+struct cuda_stream_ram_entry {
+    uint64_t offset;
+    uint64_t bytes;
+    char *buf;
+    int prev;
+    int next;
+};
+static std::unordered_map<cuda_stream_ram_key,
+                          int,
+                          cuda_stream_ram_key_hash,
+                          cuda_stream_ram_key_eq> g_stream_ram_index;
+static std::vector<cuda_stream_ram_entry> g_stream_ram_entries;
+static std::vector<int> g_stream_ram_free_slots;
+static std::vector<std::pair<uint64_t, char *>> g_stream_ram_pool;
+static uint64_t g_stream_ram_pool_bytes;
+static uint64_t g_stream_ram_capacity_bytes;
+static uint64_t g_stream_ram_used_bytes;
+static int g_stream_ram_lru_head = -1;
+static int g_stream_ram_lru_tail = -1;
+static int g_stream_ram_resolved;
+static uint64_t g_stream_ram_hits;
+static uint64_t g_stream_ram_misses;
+static uint64_t g_stream_ram_evictions;
+static uint64_t g_stream_ram_insert_bytes;
+static pthread_mutex_t g_stream_ram_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t cuda_stream_ram_cache_capacity(void);
+static int cuda_stream_ram_cache_copy(uint64_t offset, uint64_t bytes,
+                                      void *dst, uint64_t dst_bytes);
+static void cuda_stream_ram_cache_insert(uint64_t offset, uint64_t bytes,
+                                         const void *src);
+static void cuda_stream_ram_cache_release(void);
+
 static int cuda_ok(cudaError_t err, const char *what);
 static double cuda_wall_sec(void);
 static uint64_t cuda_model_copy_chunk_bytes(void);
@@ -467,6 +529,16 @@ static void cuda_stream_cache_stats_print(const char *label) {
             (unsigned long long)g_stream_cache_stats.max_resident_count,
             (double)g_stream_cache_stats.max_resident_bytes / 1073741824.0,
             g_stream_expert_cache_budget);
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "stream host RAM cache: "
+            "hits=%llu misses=%llu evictions=%llu inserted=%.2f GiB "
+            "live=%.2f/%.2f GiB\n",
+            (unsigned long long)g_stream_ram_hits,
+            (unsigned long long)g_stream_ram_misses,
+            (unsigned long long)g_stream_ram_evictions,
+            (double)g_stream_ram_insert_bytes / 1073741824.0,
+            (double)g_stream_ram_used_bytes / 1073741824.0,
+            (double)g_stream_ram_capacity_bytes / 1073741824.0);
     if (!cuda_stream_cache_layer_stats_on()) return;
     for (uint32_t layer = 0;
          layer < DS4_ROCM_STREAM_CACHE_LAYER_STATS_MAX;
@@ -680,7 +752,17 @@ static void cuda_stream_resident_cache_release(void) {
     g_stream_expert_slot_count = 0;
 }
 
+static void cuda_stream_batch_selected_packed_release(void) {
+    if (!g_stream_batch_selected_cache.packed) return;
+    (void)cuda_stream_batch_selected_reuse_wait("streaming packed expert release");
+    (void)cudaFree(g_stream_batch_selected_cache.packed);
+    g_stream_batch_selected_cache.packed = NULL;
+    g_stream_batch_selected_cache.packed_capacity = 0;
+}
+
 static void cuda_stream_layer_expert_cache_release(void) {
+    /* Prefill scratch must not reduce the following decode's expert budget. */
+    cuda_stream_batch_selected_packed_release();
     bool any_active = false;
     for (uint32_t i = 0; i < 2u; i++) {
         if (g_stream_layer_expert_cache[i].base) {
@@ -727,6 +809,7 @@ static void cuda_stream_batch_selected_cache_release(void) {
             "streaming batch selected cache release");
     (void)cuda_stream_batch_selected_upload_wait_host(
             "streaming batch selected cache release upload");
+    cuda_stream_batch_selected_packed_release();
     if (g_stream_batch_selected_cache.selected_ids) {
         (void)cudaFree(g_stream_batch_selected_cache.selected_ids);
     }
@@ -1537,7 +1620,10 @@ static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
     static int64_t cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_ROCM_STREAM_FREE_RESERVE_GB");
-        uint64_t gib = 16;
+        /* The 16 GiB UMA reserve cannot fit on a 16 GiB discrete GPU at all.
+         * Discrete cards reserve device scratch here; host RAM admission is
+         * independently enforced by ds4_rocm_malloc_host. */
+        uint64_t gib = ds4_rocm_uses_host_ram() ? 16u : 2u;
         if (env && env[0]) {
             char *end = NULL;
             errno = 0;
@@ -1761,6 +1847,8 @@ typedef struct cuda_stream_read_job {
     int uploaded;
     int errnum;
     int direct;
+    int from_ram;
+    int insert;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -1949,6 +2037,253 @@ static int cuda_stream_read_direct_disabled(void) {
     return g_stream_read_direct_disabled;
 }
 
+/* ---- streaming host-RAM expert cache ------------------------------------ */
+
+static uint64_t cuda_stream_ram_cache_capacity(void) {
+    if (g_stream_ram_resolved) return g_stream_ram_capacity_bytes;
+    g_stream_ram_resolved = 1;
+    const char *env_bytes = getenv("DS4_ROCM_STREAM_RAM_CACHE_BYTES");
+    const char *env = getenv("DS4_ROCM_STREAM_RAM_CACHE_GB");
+    uint64_t capacity = 0;
+    int explicit_setting = 0;
+    if (env_bytes != NULL && env_bytes[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long long v = strtoull(env_bytes, &end, 10);
+        if (end != env_bytes && *end == '\0' && errno == 0) {
+            capacity = (uint64_t)v;
+            explicit_setting = 1;
+        } else {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "invalid DS4_ROCM_STREAM_RAM_CACHE_BYTES=%s; "
+                    "using automatic host RAM cache sizing\n",
+                    env_bytes);
+        }
+    } else if (env != NULL && env[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long long gib = strtoull(env, &end, 10);
+        if (end != env && *end == '\0' && errno == 0 && gib <= 256u) {
+            capacity = (uint64_t)gib * 1073741824ull;
+            explicit_setting = 1;
+        } else {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "invalid DS4_ROCM_STREAM_RAM_CACHE_GB=%s; "
+                    "using automatic host RAM cache sizing\n",
+                    env);
+        }
+    }
+    if (!explicit_setting) {
+        /*
+         * Unified-memory devices already keep experts in system RAM through
+         * the VRAM cache, so a second host copy would only shrink the budget.
+         * Discrete GPUs take half of the usable host memory (physical and
+         * commit headroom), clamped to keep the machine responsive.
+         */
+        if (!ds4_rocm_uses_host_ram()) {
+            uint64_t available = 0;
+            if (ds4_linux_nonmovable_memory(&available)) {
+                capacity = available / 2u;
+                const uint64_t min_capacity = 2ull << 30;
+                const uint64_t max_capacity = 32ull << 30;
+                if (capacity < min_capacity) capacity = min_capacity;
+                if (capacity > max_capacity) capacity = max_capacity;
+            }
+        }
+    }
+    g_stream_ram_capacity_bytes = capacity;
+    if (capacity != 0) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming host RAM expert cache: %.2f GiB%s\n",
+                (double)capacity / 1073741824.0,
+                (!explicit_setting && !ds4_rocm_uses_host_ram()) ? " (auto)" : "");
+    }
+    return capacity;
+}
+
+static void cuda_stream_ram_lru_unlink(int slot) {
+    cuda_stream_ram_entry &e = g_stream_ram_entries[(size_t)slot];
+    if (e.prev >= 0) {
+        g_stream_ram_entries[(size_t)e.prev].next = e.next;
+    } else {
+        g_stream_ram_lru_head = e.next;
+    }
+    if (e.next >= 0) {
+        g_stream_ram_entries[(size_t)e.next].prev = e.prev;
+    } else {
+        g_stream_ram_lru_tail = e.prev;
+    }
+    e.prev = -1;
+    e.next = -1;
+}
+
+static void cuda_stream_ram_lru_push_front(int slot) {
+    cuda_stream_ram_entry &e = g_stream_ram_entries[(size_t)slot];
+    e.prev = -1;
+    e.next = g_stream_ram_lru_head;
+    if (g_stream_ram_lru_head >= 0) {
+        g_stream_ram_entries[(size_t)g_stream_ram_lru_head].prev = slot;
+    }
+    g_stream_ram_lru_head = slot;
+    if (g_stream_ram_lru_tail < 0) g_stream_ram_lru_tail = slot;
+}
+
+static void cuda_stream_ram_lru_touch(int slot) {
+    if (g_stream_ram_lru_head == slot) return;
+    cuda_stream_ram_lru_unlink(slot);
+    cuda_stream_ram_lru_push_front(slot);
+}
+
+static char *cuda_stream_ram_pool_take(uint64_t bytes) {
+    for (size_t i = 0; i < g_stream_ram_pool.size(); i++) {
+        if (g_stream_ram_pool[i].first == bytes) {
+            char *buf = g_stream_ram_pool[i].second;
+            g_stream_ram_pool[i] = g_stream_ram_pool.back();
+            g_stream_ram_pool.pop_back();
+            g_stream_ram_pool_bytes -= bytes;
+            return buf;
+        }
+    }
+    return NULL;
+}
+
+static void cuda_stream_ram_pool_put(uint64_t bytes, char *buf) {
+    if (!buf) return;
+    const uint64_t pool_cap = 256ull << 20;
+    if (bytes != 0 && bytes <= pool_cap &&
+        g_stream_ram_pool_bytes <= pool_cap - bytes &&
+        g_stream_ram_pool.size() < 256u) {
+        g_stream_ram_pool.push_back({bytes, buf});
+        g_stream_ram_pool_bytes += bytes;
+        return;
+    }
+    free(buf);
+}
+
+static void cuda_stream_ram_evict(uint64_t bytes) {
+    while (g_stream_ram_used_bytes + bytes > g_stream_ram_capacity_bytes &&
+           g_stream_ram_lru_tail >= 0) {
+        const int slot = g_stream_ram_lru_tail;
+        cuda_stream_ram_entry &e = g_stream_ram_entries[(size_t)slot];
+        cuda_stream_ram_lru_unlink(slot);
+        g_stream_ram_index.erase(cuda_stream_ram_key{e.offset, e.bytes});
+        g_stream_ram_used_bytes =
+            g_stream_ram_used_bytes >= e.bytes ?
+                g_stream_ram_used_bytes - e.bytes : 0;
+        cuda_stream_ram_pool_put(e.bytes, e.buf);
+        e.offset = 0;
+        e.bytes = 0;
+        e.buf = NULL;
+        g_stream_ram_free_slots.push_back(slot);
+        g_stream_ram_evictions++;
+    }
+}
+
+static void cuda_stream_ram_cache_release(void) {
+    if (!g_stream_ram_resolved && g_stream_ram_entries.empty() &&
+        g_stream_ram_pool.empty()) {
+        return;
+    }
+    pthread_mutex_lock(&g_stream_ram_mutex);
+    for (size_t i = 0; i < g_stream_ram_entries.size(); i++) {
+        free(g_stream_ram_entries[i].buf);
+        g_stream_ram_entries[i].buf = NULL;
+    }
+    g_stream_ram_entries.clear();
+    g_stream_ram_index.clear();
+    g_stream_ram_free_slots.clear();
+    for (size_t i = 0; i < g_stream_ram_pool.size(); i++) {
+        free(g_stream_ram_pool[i].second);
+    }
+    g_stream_ram_pool.clear();
+    g_stream_ram_pool_bytes = 0;
+    g_stream_ram_used_bytes = 0;
+    g_stream_ram_lru_head = -1;
+    g_stream_ram_lru_tail = -1;
+    pthread_mutex_unlock(&g_stream_ram_mutex);
+}
+
+static int cuda_stream_ram_cache_copy(uint64_t offset,
+                                      uint64_t bytes,
+                                      void *dst,
+                                      uint64_t dst_bytes) {
+    if (!dst || bytes == 0 || bytes > dst_bytes) return 0;
+    if (cuda_stream_ram_cache_capacity() == 0) return 0;
+    pthread_mutex_lock(&g_stream_ram_mutex);
+    std::unordered_map<cuda_stream_ram_key,
+                       int,
+                       cuda_stream_ram_key_hash,
+                       cuda_stream_ram_key_eq>::iterator it =
+        g_stream_ram_index.find(cuda_stream_ram_key{offset, bytes});
+    if (it == g_stream_ram_index.end()) {
+        g_stream_ram_misses++;
+        pthread_mutex_unlock(&g_stream_ram_mutex);
+        return 0;
+    }
+    /*
+     * Copy under the lock: entries can be evicted concurrently by the other
+     * read workers, and holding the lock keeps the source buffer alive.
+     */
+    const cuda_stream_ram_entry &e = g_stream_ram_entries[(size_t)it->second];
+    memcpy(dst, e.buf, (size_t)bytes);
+    cuda_stream_ram_lru_touch(it->second);
+    g_stream_ram_hits++;
+    pthread_mutex_unlock(&g_stream_ram_mutex);
+    return 1;
+}
+
+static void cuda_stream_ram_cache_insert(uint64_t offset,
+                                         uint64_t bytes,
+                                         const void *src) {
+    if (!src || bytes == 0) return;
+    const uint64_t capacity = cuda_stream_ram_cache_capacity();
+    if (capacity == 0 || bytes > capacity) return;
+    char *buf = NULL;
+    pthread_mutex_lock(&g_stream_ram_mutex);
+    if (g_stream_ram_index.find(cuda_stream_ram_key{offset, bytes}) !=
+        g_stream_ram_index.end()) {
+        pthread_mutex_unlock(&g_stream_ram_mutex);
+        return;
+    }
+    buf = cuda_stream_ram_pool_take(bytes);
+    pthread_mutex_unlock(&g_stream_ram_mutex);
+    if (!buf) {
+        buf = (char *)malloc((size_t)bytes);
+        if (!buf) return;
+    }
+    memcpy(buf, src, (size_t)bytes);
+    pthread_mutex_lock(&g_stream_ram_mutex);
+    if (g_stream_ram_index.find(cuda_stream_ram_key{offset, bytes}) !=
+        g_stream_ram_index.end()) {
+        cuda_stream_ram_pool_put(bytes, buf);
+        pthread_mutex_unlock(&g_stream_ram_mutex);
+        return;
+    }
+    cuda_stream_ram_evict(bytes);
+    if (g_stream_ram_used_bytes + bytes > g_stream_ram_capacity_bytes) {
+        cuda_stream_ram_pool_put(bytes, buf);
+        pthread_mutex_unlock(&g_stream_ram_mutex);
+        return;
+    }
+    int slot = -1;
+    if (!g_stream_ram_free_slots.empty()) {
+        slot = g_stream_ram_free_slots.back();
+        g_stream_ram_free_slots.pop_back();
+    } else {
+        slot = (int)g_stream_ram_entries.size();
+        g_stream_ram_entries.push_back(cuda_stream_ram_entry{0, 0, NULL, -1, -1});
+    }
+    cuda_stream_ram_entry &e = g_stream_ram_entries[(size_t)slot];
+    e.offset = offset;
+    e.bytes = bytes;
+    e.buf = buf;
+    g_stream_ram_index[cuda_stream_ram_key{offset, bytes}] = slot;
+    g_stream_ram_used_bytes += bytes;
+    g_stream_ram_insert_bytes += bytes;
+    cuda_stream_ram_lru_push_front(slot);
+    pthread_mutex_unlock(&g_stream_ram_mutex);
+}
+
 static void cuda_stream_read_job_run(cuda_stream_read_job *job,
                                      void *stage,
                                      uint64_t stage_bytes) {
@@ -1957,12 +2292,23 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
     job->uploaded = 0;
     job->errnum = 0;
     job->direct = 0;
+    job->from_ram = 0;
     if (!stage || job->bytes == 0 || g_model_fd < 0) {
         job->errnum = EINVAL;
         return;
     }
     job->host_raw = stage;
     job->host_buf = stage;
+    /*
+     * Host-RAM tier: replay a previously streamed span from process memory.
+     * The payload is a byte-exact copy of the file bytes, so kernels see the
+     * same data; only the I/O source differs.
+     */
+    if (cuda_stream_ram_cache_copy(job->offset, job->bytes, stage, stage_bytes)) {
+        job->from_ram = 1;
+        job->ok = 1;
+        return;
+    }
 #if defined(__linux__) && defined(O_DIRECT)
     /*
      * Direct reads skip the page cache: no page allocation, no extra copy and
@@ -1993,6 +2339,11 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
 #endif
     if (cuda_pread_full(g_model_fd, job->host_buf, job->bytes, job->offset)) {
         job->ok = 1;
+        if (job->insert) {
+            cuda_stream_ram_cache_insert(job->offset,
+                                         job->bytes,
+                                         job->host_buf);
+        }
     } else {
         job->errnum = errno ? errno : EIO;
     }
@@ -2021,7 +2372,9 @@ static int cuda_stream_read_job_upload(
         return 0;
     }
     job->uploaded = 1;
-    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
+    if (!job->direct && !job->from_ram) {
+        cuda_model_drop_file_pages(job->offset, job->bytes);
+    }
     return 1;
 }
 
@@ -2496,7 +2849,7 @@ static int cuda_stream_selected_upload_read_jobs(
             (void)cudaGetLastError();
             return 0;
         }
-        if (!jobs[i].direct) {
+        if (!jobs[i].direct && !jobs[i].from_ram) {
             cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
         }
     }
@@ -3647,6 +4000,50 @@ static int cuda_stream_batch_selected_prepare(
     return ok;
 }
 
+/* Pack only selected experts on-device so prefill can use the resident tiled
+ * kernels, including their hot-expert WMMA arithmetic. Switching to the scalar
+ * pointer-table kernels changes logits even when the weight bytes are equal.
+ * The existing compact IDs address these tables; the reuse event protects both
+ * the IDs and this buffer until all resident kernels have finished. */
+static int cuda_stream_batch_selected_pack(
+        const char **gate, const char **up, const char **down) {
+    if (!cuda_stream_batch_selected_finish_pending_missing() ||
+        !cuda_stream_batch_selected_wait_upload_ready()) return 0;
+    cuda_stream_batch_selected_cache *c = &g_stream_batch_selected_cache;
+    uint64_t gate_bytes, down_bytes, pair_bytes, bytes;
+    if (c->n_unique == 0 ||
+        !cuda_u64_mul_checked(c->n_unique, c->gate_expert_bytes, &gate_bytes) ||
+        !cuda_u64_mul_checked(c->n_unique, c->down_expert_bytes, &down_bytes) ||
+        !cuda_u64_mul_checked(2u, gate_bytes, &pair_bytes) ||
+        !cuda_u64_add_checked(pair_bytes, down_bytes, &bytes) || bytes > SIZE_MAX) return 0;
+    if (c->packed_capacity < bytes) {
+        if (c->packed) (void)cudaFree(c->packed);
+        c->packed = NULL;
+        c->packed_capacity = 0;
+        if (!cuda_ok(cudaMalloc((void **)&c->packed, (size_t)bytes),
+                     "streaming batch packed expert allocation")) return 0;
+        c->packed_capacity = bytes;
+    }
+    *gate = c->packed;
+    *up = c->packed + gate_bytes;
+    *down = c->packed + pair_bytes;
+    for (uint32_t i = 0; i < c->n_unique; i++) {
+        if (!cuda_ok(cudaMemcpyAsync(c->packed + i * c->gate_expert_bytes,
+                                     c->gate_ptrs_stage[i], (size_t)c->gate_expert_bytes,
+                                     cudaMemcpyDeviceToDevice, 0), "pack streaming gate") ||
+            !cuda_ok(cudaMemcpyAsync(c->packed + gate_bytes + i * c->gate_expert_bytes,
+                                     c->up_ptrs_stage[i], (size_t)c->gate_expert_bytes,
+                                     cudaMemcpyDeviceToDevice, 0), "pack streaming up") ||
+            !cuda_ok(cudaMemcpyAsync(c->packed + pair_bytes + i * c->down_expert_bytes,
+                                     c->down_ptrs_stage[i], (size_t)c->down_expert_bytes,
+                                     cudaMemcpyDeviceToDevice, 0), "pack streaming down")) {
+            (void)cudaStreamSynchronize(0);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int cuda_stream_layer_expert_cache_prepare_batch(
         const void *model_map,
         uint32_t layer,
@@ -4207,15 +4604,28 @@ static int cuda_stream_selected_load(
 
         if (use_fd) {
             if (read_job_count + 3u > DS4_ROCM_N_EXPERT_USED * 3u) return 0;
-            read_jobs[read_job_count++] =
+            /*
+             * Single-token loads are the reuse-prone working set (the next
+             * tokens re-route to overlapping expert sets), so let the host RAM
+             * tier record these spans for replay.  Prefill batch loads stay
+             * insert-free: their working set cycles through the model and is
+             * too large for either cache to retain.
+             */
+            read_jobs[read_job_count] =
                 {entry.gate, gate_offset + gate_rel, gate_expert_bytes,
                  NULL, NULL, 0, 0};
-            read_jobs[read_job_count++] =
+            read_jobs[read_job_count].insert = 1;
+            read_job_count++;
+            read_jobs[read_job_count] =
                 {entry.up, up_offset + gate_rel, gate_expert_bytes,
                  NULL, NULL, 0, 0};
-            read_jobs[read_job_count++] =
+            read_jobs[read_job_count].insert = 1;
+            read_job_count++;
+            read_jobs[read_job_count] =
                 {entry.down, down_offset + down_rel, down_expert_bytes,
                  NULL, NULL, 0, 0};
+            read_jobs[read_job_count].insert = 1;
+            read_job_count++;
         } else {
             cudaError_t err = cudaMemcpyAsync(entry.gate,
                                               (const char *)model_map + gate_offset + gate_rel,
@@ -4882,6 +5292,12 @@ static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
                 env);
     }
 
+    /* On VRAM-limited streaming devices, optional FP16 expansions fit only
+     * some layers. Cache eviction would then choose FP16 versus native Q8
+     * arithmetic and change logits with unrelated expert-cache pressure.
+     * Keep the native Q8 path stable; UMA retains its expansion budget. */
+    if (!ds4_rocm_uses_host_ram()) return 0;
+
     size_t free_b = 0;
     size_t total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b == 0) {
@@ -5500,12 +5916,8 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         return fallback;
     }
     (void)free_b;
-    uint64_t limit = (uint64_t)total_b / 3ull;
-    const uint64_t min_limit = 8ull * 1073741824ull;
-    const uint64_t max_limit = 48ull * 1073741824ull;
-    if (limit < min_limit) limit = min_limit;
-    if (limit > max_limit) limit = max_limit;
-    return limit;
+    return ds4_rocm_stream_model_cache_bytes((uint64_t)total_b,
+                                             ds4_rocm_uses_host_ram());
 }
 
 static int cuda_stream_model_cache_prepare_memory(
@@ -5811,6 +6223,10 @@ static void cuda_model_range_release_all(void) {
     cuda_model_range_release_ranges_only();
     g_stream_selected_cache.loaded = 0;
     cuda_stream_resident_cache_release();
+    /* The host replay cache is keyed by file offsets, so it must not survive
+     * a model change.  Workers (if any are still draining) serialize with it
+     * through its own mutex and can only repopulate bounded entries. */
+    cuda_stream_ram_cache_release();
     cuda_model_load_progress_reset();
 }
 
@@ -6163,6 +6579,7 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (g_ssd_streaming_mode) {
+        if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
         const uint64_t limit = cuda_model_cache_limit_bytes();
         if (map_size > limit) {
             fprintf(stderr,
@@ -6235,11 +6652,15 @@ extern "C" int ds4_gpu_set_model_map_spans(
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (g_ssd_streaming_mode) {
         uint64_t request_bytes = 0;
+        uint64_t missing_bytes = 0;
         for (uint32_t i = 0; i < count; i++) {
             if (!cuda_u64_add_checked(request_bytes, sizes[i], &request_bytes)) {
                 fprintf(stderr,
                         DS4_GPU_LOG_PREFIX "streaming model span byte count overflow\n");
                 return 0;
+            }
+            if (!cuda_model_range_is_cached(model_map, offsets[i], sizes[i])) {
+                missing_bytes += sizes[i]; /* bounded by the checked total */
             }
         }
         const uint64_t limit = cuda_model_cache_limit_bytes();
@@ -6251,16 +6672,20 @@ extern "C" int ds4_gpu_set_model_map_spans(
                     (double)limit / 1073741824.0);
             return 0;
         }
+        /* Do not charge already resident spans again: a repeated request near
+         * the cap must not evict and re-upload its own cached weights. */
+        if (missing_bytes == 0) return 1;
         if (g_model_range_bytes > limit ||
-            request_bytes > limit - g_model_range_bytes) {
+            missing_bytes > limit - g_model_range_bytes) {
             if (!cuda_ok(cudaDeviceSynchronize(),
                          "streaming model span cache eviction sync")) {
                 return 0;
             }
             cuda_model_range_release_ranges_only();
+            missing_bytes = request_bytes;
         }
-        if (!cuda_stream_model_cache_prepare_memory(request_bytes,
-                                                    "streaming model spans")) {
+        if (!cuda_stream_model_cache_prepare_memory(missing_bytes,
+                                                     "streaming model spans")) {
             return 0;
         }
         for (uint32_t i = 0; i < count; i++) {

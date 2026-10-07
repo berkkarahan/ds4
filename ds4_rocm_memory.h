@@ -10,6 +10,20 @@ static inline uint64_t ds4_rocm_model_arena_bytes(uint64_t need) {
     return need >= (256ull << 20) ? need : (1792ull << 20);
 }
 
+static inline uint64_t ds4_rocm_stream_model_cache_bytes(uint64_t total, bool integrated) {
+    /* A discrete GPU should retain the frequently reused dense weights before
+     * spending the rest on routed experts. The UMA one-third split capped a
+     * 16 GiB card at 8 GiB, below Flash Q2's 8.20 GiB dense working set, forcing
+     * a complete reload each token. This is a cap, not an eager allocation. */
+    uint64_t limit = total / 3u;
+    if (!integrated) limit *= 2u;
+    const uint64_t min_limit = 8ull << 30;
+    const uint64_t max_limit = 48ull << 30;
+    if (limit < min_limit) limit = min_limit;
+    if (limit > max_limit) limit = max_limit;
+    return limit;
+}
+
 static inline bool ds4_rocm_uses_host_ram(void) {
     int device;
     hipDeviceProp_t prop;

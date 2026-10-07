@@ -6,7 +6,8 @@
  * <pthread.h>. This header implements exactly the pthread subset DS4 uses on
  * top of the Win32 threading primitives:
  *
- *   pthread_t, pthread_create, pthread_join
+ *   pthread_t, pthread_create, pthread_join, pthread_self, pthread_equal
+ *   pthread_detach (reclaimed exactly once via the lifecycle state machine)
  *   pthread_mutex_t / _init / _lock / _unlock / _destroy
  *   pthread_cond_t  / _init / _wait / _signal / _broadcast / _destroy
  *   pthread_once_t  / pthread_once / PTHREAD_ONCE_INIT
@@ -15,24 +16,37 @@
  * is only pulled in for the Windows GPU build (not the MinGW CPU build, which
  * already has real pthreads), so POSIX builds are completely unaffected.
  *
- * Only included from ds4_win.h, and only when DS4_WIN_PTHREAD is requested, so
- * the MinGW CPU build keeps using winpthreads.
+ * Included directly by the host TUs that set DS4_WIN_PTHREAD (ds4.c,
+ * ds4_rocm.cu, ds4_tp.c, ds4_distributed.c), so the MinGW CPU build keeps
+ * using winpthreads.
  */
 #ifndef DS4_PTHREAD_WIN_H
 #define DS4_PTHREAD_WIN_H
 
 #ifdef _WIN32
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <process.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 /* ---- threads ------------------------------------------------------------- */
 typedef struct {
     HANDLE        handle;
+    unsigned      thread_id;
     void         *(*start)(void *);
     void         *arg;
     void         *retval;
+    /* Lifecycle: 0 running+joinable, 1 running+detached,
+     * 2 finished+joinable, 3 finished+detached (resources reclaimed).
+     * The trampoline and pthread_detach each CAS this into the terminal
+     * finished+detached state; whoever performs that last transition owns the
+     * CloseHandle/free, so a detached thread is reclaimed exactly once. */
+    volatile LONG state;
 } ds4_pthread_state;
 typedef ds4_pthread_state *pthread_t;
 
@@ -40,6 +54,17 @@ static unsigned __stdcall ds4_pthread_trampoline(void *p)
 {
     ds4_pthread_state *st = (ds4_pthread_state *)p;
     st->retval = st->start(st->arg);
+    for (;;) {
+        const LONG cur = InterlockedCompareExchange(&st->state, 0, 0);
+        LONG next = -1;
+        if (cur == 0) next = 2;      /* finished while joinable: joiner reclaims */
+        else if (cur == 1) next = 3; /* finished after detach: reclaim here */
+        else break;
+        if (InterlockedCompareExchange(&st->state, next, cur) == cur) {
+            if (next == 3) { CloseHandle(st->handle); free(st); }
+            break;
+        }
+    }
     return 0;
 }
 
@@ -51,7 +76,8 @@ static inline int pthread_create(pthread_t *thread, const void *attr,
     if (!st) return EAGAIN;
     st->start = start;
     st->arg   = arg;
-    uintptr_t h = _beginthreadex(NULL, 0, ds4_pthread_trampoline, st, 0, NULL);
+    uintptr_t h = _beginthreadex(NULL, 0, ds4_pthread_trampoline, st, 0,
+                                 &st->thread_id);
     if (h == 0) { free(st); return EAGAIN; }
     st->handle = (HANDLE)h;
     *thread = st;
@@ -60,24 +86,54 @@ static inline int pthread_create(pthread_t *thread, const void *attr,
 
 static inline int pthread_join(pthread_t thread, void **retval)
 {
-    if (!thread) return EINVAL;
-    WaitForSingleObject(thread->handle, INFINITE);
+    if (!thread || ((uintptr_t)thread & 1u)) return EINVAL;
+    if (InterlockedCompareExchange(&thread->state, 0, 0) == 1) {
+        return EINVAL; /* joining a detached thread is undefined per POSIX */
+    }
+    if (thread->thread_id == GetCurrentThreadId()) return EDEADLK;
+    if (WaitForSingleObject(thread->handle, INFINITE) != WAIT_OBJECT_0) return EINVAL;
     if (retval) *retval = thread->retval;
     CloseHandle(thread->handle);
     free(thread);
     return 0;
 }
 
-/* pthread_detach: drop the OS handle without waiting. ds4_distributed.c detaches
- * its fire-and-forget server threads; those only run under the distributed
- * serving modes the bench never enters, so the small state leak on detach is
- * inconsequential for the compile/bench target. */
+/* pthread_detach: mark the thread detached. If it already finished, reclaim
+ * its handle/state here; otherwise the trampoline reclaims on exit. */
 static inline int pthread_detach(pthread_t thread)
 {
-    if (!thread) return EINVAL;
-    if (thread->handle) CloseHandle(thread->handle);
-    thread->handle = NULL;
-    return 0;
+    if (!thread || ((uintptr_t)thread & 1u)) return EINVAL;
+    for (;;) {
+        const LONG cur = InterlockedCompareExchange(&thread->state, 0, 0);
+        LONG next = -1;
+        if (cur == 0) next = 1;      /* running: trampoline reclaims at exit */
+        else if (cur == 2) next = 3; /* finished: reclaim now */
+        else return 0;               /* already detached or reclaimed */
+        if (InterlockedCompareExchange(&thread->state, next, cur) == cur) {
+            if (next == 3) { CloseHandle(thread->handle); free(thread); }
+            return 0;
+        }
+    }
+}
+
+/* pthread_self / pthread_equal: a pthread created by this shim is represented
+ * by its state pointer; pthread_self returns a low-bit-tagged Win32 thread ID.
+ * pthread_equal normalizes either representation, so caller threads that were
+ * not created through this shim still have distinct, comparable identities. */
+static inline pthread_t pthread_self(void)
+{
+    return (pthread_t)((((uintptr_t)GetCurrentThreadId()) << 1u) | 1u);
+}
+
+static inline int pthread_equal(pthread_t a, pthread_t b)
+{
+    uintptr_t av = (uintptr_t)a;
+    uintptr_t bv = (uintptr_t)b;
+    uintptr_t aid = (av & 1u) ? av >> 1u :
+                    a ? (uintptr_t)((ds4_pthread_state *)a)->thread_id : 0;
+    uintptr_t bid = (bv & 1u) ? bv >> 1u :
+                    b ? (uintptr_t)((ds4_pthread_state *)b)->thread_id : 0;
+    return aid == bid;
 }
 
 /* ---- mutex (non-recursive; matches PTHREAD default) ---------------------- */
@@ -141,7 +197,6 @@ static inline int pthread_cond_destroy(pthread_cond_t *c)
 typedef INIT_ONCE pthread_once_t;
 #define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
 
-static void (*ds4_once_fn)(void);
 static BOOL CALLBACK ds4_once_trampoline(PINIT_ONCE io, PVOID param, PVOID *ctx)
 {
     (void)io; (void)ctx;

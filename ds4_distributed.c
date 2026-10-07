@@ -6883,7 +6883,15 @@ static int dist_mem_read(ds4_dist_mem_reader *r, void *dst, uint32_t len) {
 
 static int dist_temp_file(const char *prefix, char *path, size_t path_len, FILE **fp_out) {
     char tmpl[PATH_MAX];
+#ifdef _WIN32
+    /* Native Windows has no /tmp: stage in %TEMP%. */
+    char name[PATH_MAX];
+    int n = snprintf(name, sizeof(name), "%s.XXXXXX", prefix);
+    if (n < 0 || (size_t)n >= sizeof(name) ||
+        ds4_win_temp_path(tmpl, sizeof(tmpl), name) != 0) return -1;
+#else
     snprintf(tmpl, sizeof(tmpl), "/tmp/%s.XXXXXX", prefix);
+#endif
     int fd = mkstemp(tmpl);
     if (fd < 0) return -1;
     FILE *fp = fdopen(fd, "w+b");

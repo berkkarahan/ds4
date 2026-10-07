@@ -747,6 +747,10 @@ static int routed_moe_launch(
     }
     if (compact_selected && !cuda_stream_selected_wait_upload_ready()) return 0;
 
+    const int packed_batch = iq2_path &&
+        (batch_stream_selected || batch_stream_split_selected);
+    if (packed_batch && !cuda_stream_batch_selected_pack(&gate_w, &up_w, &down_w)) return 0;
+
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
@@ -816,9 +820,9 @@ static int routed_moe_launch(
         const uint32_t use_rocm_mmq_gateup =
             ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
             n_total_expert <= 256u &&
-            !batch_stream_selected && !batch_stream_split_selected &&
+            (packed_batch || (!batch_stream_selected && !batch_stream_split_selected)) &&
             !split_selected && !compact_selected && gate_w && up_w &&
-            (stream_full_layer || full_table_cached) &&
+            (packed_batch || stream_full_layer || full_table_cached) &&
             ds4_rocm_gfx1151_flag("DS4_ROCM_MMQ_IQ2");
         uint32_t down_row_groups = 1u;
         {
@@ -865,7 +869,7 @@ static int routed_moe_launch(
             q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         }
-        if (ok && (batch_stream_selected || batch_stream_split_selected)) {
+        if (ok && !packed_batch && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
             if (batch_stream_split_selected) {
                 if (stream_batch_resident_count != 0u) {
@@ -2071,6 +2075,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
+        if (ok && packed_batch) ok = cuda_stream_batch_selected_mark_inflight();
         return ok;
     }
 
@@ -2801,6 +2806,7 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
+    if (ok && packed_batch) ok = cuda_stream_batch_selected_mark_inflight();
     return ok;
 }
 

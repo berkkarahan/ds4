@@ -691,6 +691,16 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
             a1[i] = sc * (_Float16)(float)(int)w1[i];
         }
 
+#if defined(__GFX12__)
+        /* RDNA4 (gfx12) cannot lower the gfx11 16x16x16 f16 WMMA intrinsic and
+         * uses a different fragment layout, so this gfx1151-tuned kernel is
+         * never dispatched on gfx12 (see the ds4_rocm_is_gfx1151() guard in
+         * ds4_rocm_matmul.cuh). Trap rather than store the zero accumulators:
+         * an accidental dispatch must fail loudly, not return silent garbage. */
+        (void)a0;
+        (void)a1;
+        __builtin_trap();
+#else
 #pragma unroll
         for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
             const uint32_t nt = ntile * 16u + lane16;
@@ -711,6 +721,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
                 acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
             }
         }
+#endif
         __syncthreads();
     }
 

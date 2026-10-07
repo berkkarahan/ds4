@@ -8,11 +8,11 @@
  * surface ds4_distributed.c uses, mapped onto Winsock2 / ws2tcpip.
  *
  * Scope: enough for ds4_distributed.c to *compile and link* on Windows so that
- * ds4-bench.exe builds. The bench never enters distributed serving, so the
- * runtime fidelity of a few calls (notably dup() of a socket and WSAStartup
- * lifetime) is not exercised by the bench. Anything that would need real
- * runtime parity for `--role coordinator/worker` on Windows is called out in
- * win/README.md as a follow-up.
+ * ds4-bench.exe builds, plus faithful dup() (WSADuplicateSocket) and
+ * SO_RCVTIMEO/SO_SNDTIMEO handling for serving-mode traffic. The bench never
+ * enters distributed serving, so the remaining runtime-fidelity gaps
+ * (MSG_DONTWAIT emulation, WSACleanup lifetime) are not exercised by the
+ * bench and are called out in win/README.md as follow-ups.
  *
  * Header-only, self-contained. Whole body guarded by _WIN32 (and not pulled in
  * by the MinGW CPU build, which is GPU-less and does not link the distributed
@@ -37,8 +37,12 @@
 #include <errno.h>
 #include <stdio.h>
 
+#ifdef _MSC_VER
+/* The MSVC-ABI link pulls these in automatically; gcc needs them on the link
+ * line instead (the Makefile windows-cpu target passes -lws2_32 -liphlpapi). */
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#endif
 
 /* ---- POSIX errno aliases for the Winsock failure codes ds4_distributed.c
  * inspects. recv/send/poll set errno via the wrappers below. -------------- */
@@ -59,6 +63,13 @@ typedef int socklen_t;
 #endif
 #endif
 
+/* ssize_t: MSVC spells it SSIZE_T (<BaseTsd.h>, pulled in via winsock2.h). The
+ * POSIX name is defined here because this shim is included before ds4_win.h. */
+#if !defined(_SSIZE_T_DEFINED) && !defined(_SSIZE_T_)
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
+
 /* poll(): provided as WSAPoll on Windows Vista+. struct pollfd / POLL* and
  * nfds_t come from winsock2.h. SHUT_RDWR maps to SD_BOTH. */
 #ifndef SHUT_RD
@@ -68,6 +79,11 @@ typedef int socklen_t;
 #endif
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0    /* Windows never raises SIGPIPE on a dead socket */
+#endif
+/* Winsock has no MSG_DONTWAIT; non-blocking is a socket mode, not a per-call
+ * flag. ds4_tp.c's gate traffic (not exercised by the bench) is the only user. */
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
 #endif
 
 /* ds4_distributed.c calls poll() directly; route it to WSAPoll. */
@@ -160,22 +176,42 @@ static __inline int ds4_win_connect(int s, const struct sockaddr *addr, socklen_
 
 /* setsockopt: ds4_distributed.c passes plain pointers (int / struct timeval).
  * Winsock wants `const char *`; cast through. SO_RCVTIMEO/SO_SNDTIMEO take a
- * DWORD-milliseconds value on Windows rather than a struct timeval, but the
- * bench does not serve, so the (compiling) cast is sufficient here. */
+ * DWORD milliseconds value on Windows rather than a struct timeval, so convert
+ * those when the caller passes the POSIX-sized value. */
 static __inline int ds4_win_setsockopt(int s, int level, int opt,
                                        const void *val, socklen_t len)
 {
-    int r = setsockopt((SOCKET)s, level, opt, (const char *)val, len);
+    int r;
+    if (level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO) &&
+        len == (socklen_t)sizeof(struct timeval)) {
+        const struct timeval *tv = (const struct timeval *)val;
+        const DWORD ms = (DWORD)((long long)tv->tv_sec * 1000 + tv->tv_usec / 1000);
+        r = setsockopt((SOCKET)s, level, opt, (const char *)&ms, (int)sizeof(ms));
+    } else {
+        r = setsockopt((SOCKET)s, level, opt, (const char *)val, len);
+    }
     if (r != 0) errno = WSAGetLastError();
     return r;
 }
 #define setsockopt(s, lvl, o, v, l) ds4_win_setsockopt((s), (lvl), (o), (v), (l))
 
-/* dup() of a socket: a faithful port needs WSADuplicateSocket; the bench never
- * takes this path (coordinator-only). _dup keeps the link resolving and the
- * call type-correct; flagged as a serving-mode follow-up in win/README.md. */
+/* dup() of a socket: the CRT's _dup cannot duplicate a Winsock socket, so use
+ * WSADuplicateSocket for the in-process equivalent of dup(2). Non-socket fds
+ * (mkstemp staging, pipes) fall back to _dup. */
+static __inline int ds4_win_dup(int fd)
+{
+    WSAPROTOCOL_INFOA info;
+    if (WSADuplicateSocketA((SOCKET)fd, GetCurrentProcessId(), &info) == 0) {
+        SOCKET d = WSASocketA(info.iAddressFamily, info.iSocketType,
+                              info.iProtocol, &info, 0, 0);
+        if (d != INVALID_SOCKET) return (int)d;
+    }
+    if (WSAGetLastError() == WSAENOTSOCK) return _dup(fd);
+    errno = WSAGetLastError();
+    return -1;
+}
 #ifndef dup
-#define dup(fd) _dup(fd)
+#define dup(fd) ds4_win_dup(fd)
 #endif
 
 /* ---- O_NONBLOCK + iovec/sendmsg/recvmsg ----------------------------------
@@ -185,7 +221,7 @@ static __inline int ds4_win_setsockopt(int s, int level, int opt,
  * provides. Same scope rules as above: enough for ds4-bench.exe to compile and
  * link; the TP serving path is not exercised by the bench. struct timeval
  * itself comes from <winsock2.h> (MSVC) or MinGW's <time.h>; struct pollfd
- * and the POLL*/MSG_DONTWAIT constants come from <winsock2.h>. */
+ * and the POLL* and MSG_DONTWAIT constants come from <winsock2.h>. */
 #ifndef O_NONBLOCK
 #define O_NONBLOCK 0x20    /* flag value only: ds4_win.h makes fcntl a no-op */
 #endif

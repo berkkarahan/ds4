@@ -20069,6 +20069,9 @@ static uint32_t metal_graph_stream_prefill_batch_selected_addr_auto_min(void) {
     return 0;
 }
 
+static bool metal_graph_stream_prefill_batch_selected_addr_layer_supported(
+        const ds4_weights *weights, uint32_t il);
+
 static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
@@ -20096,14 +20099,9 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         return false;
     }
 #ifdef DS4_ROCM_BUILD
-    const bool selected_iq2 =
-        glm_stream_selected_expert_cache_supported(layer, routed_il);
-    const bool selected_q2 =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q2_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q2_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-        glm_stream_expert_cache_addr_layout_supported(weights, layer, routed_il);
-    if (!selected_iq2 && !selected_q2) return false;
+    if (!metal_graph_stream_prefill_batch_selected_addr_layer_supported(weights, routed_il)) {
+        return false;
+    }
 #else
     if (DS4_N_EXPERT_USED != 6 ||
         layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
@@ -20195,6 +20193,16 @@ static bool metal_graph_stream_prefill_batch_selected_addr_layer_supported(
     }
 
 #ifdef DS4_ROCM_BUILD
+    /* The ROCm runtime packs selected IQ2/Q2 experts for the same tiled kernels
+     * used by resident prefill. Avoid also mapping entire routed tensors here:
+     * that evicts the dense weights and repeats the SSD reads each layer. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        DS4_N_EXPERT_USED == 6 &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+        return true;
+    }
     const bool selected_iq2 =
         glm_stream_selected_expert_cache_supported(layer, il);
     const bool selected_q2 =
@@ -20718,7 +20726,9 @@ static bool metal_graph_stream_pread_range(
         const size_t want = rem > (uint64_t)chunk ? chunk : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(model->fd, buf, want, (off_t)pos);
+            /* MSVC's off_t is 32-bit; do not truncate GGUF offsets before
+             * passing them to the Windows positional-read shim. */
+            nread = pread(model->fd, buf, want, (int64_t)pos);
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = false;
@@ -57382,7 +57392,7 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
     uint32_t done = 0;
     while (done < bytes) {
-        ssize_t n = pread(m->ngram_fd, raw + done, bytes - done, (off_t)(offset + done));
+        ssize_t n = pread(m->ngram_fd, raw + done, bytes - done, (int64_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0 || (size_t)n > bytes - done) {
             if (!n) errno = EIO;
@@ -60139,7 +60149,19 @@ static void ds4_release_instance_lock(void) {
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
+#ifdef _WIN32
+    char win_default[PATH_MAX];
+    if (!path || !path[0]) {
+        /* Native Windows has no /tmp: default the lock into %TEMP%. */
+        if (ds4_win_temp_path(win_default, sizeof(win_default), "ds4.lock") != 0) {
+            fprintf(stderr, "ds4: cannot resolve Windows lock path: %s\n", strerror(errno));
+            exit(2);
+        }
+        path = win_default;
+    }
+#else
     if (!path || !path[0]) path = "/tmp/ds4.lock";
+#endif
 
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0) {
@@ -62603,7 +62625,16 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
 
+#ifdef _WIN32
+    /* Native Windows has no /tmp: stage payloads in %TEMP%. */
+    char tmpl[PATH_MAX];
+    if (ds4_win_temp_path(tmpl, sizeof(tmpl), "ds4-session-payload-XXXXXX") != 0) {
+        payload_set_err(err, errlen, "failed to resolve staged session payload path");
+        return 1;
+    }
+#else
     char tmpl[] = "/tmp/ds4-session-payload.XXXXXX";
+#endif
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         payload_set_err(err, errlen, "failed to create staged session payload");
@@ -62624,7 +62655,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
     }
-    off_t pos = -1;
+    int64_t pos = -1;
     if (rc == 0) {
         pos = ftello(fp);
         if (pos < 0) {

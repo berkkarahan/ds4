@@ -236,7 +236,14 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
     if (!cuda_ok(cudaGetLastError(), "visual attention KV pack launch"))
         return 0;
 
+    /* MSVC's <math.h> has no host rsqrtf (HIP declares it __device__ only), so
+     * the Windows host host-side scaling uses an exact reciprocal square root;
+     * POSIX keeps the upstream rsqrtf to preserve numerics. */
+#ifdef _WIN32
+    const float alpha = 1.0f / sqrtf((float)head_dim);
+#else
     const float alpha = rsqrtf((float)head_dim);
+#endif
     const float beta = 0.0f;
     cublasStatus_t status = cublasSgemmStridedBatched(
             g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,

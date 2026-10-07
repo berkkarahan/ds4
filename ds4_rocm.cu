@@ -28,12 +28,20 @@
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#if defined(_WIN32) && defined(DS4_WIN_PTHREAD)
+/* Native Windows ROCm/MSVC-ABI build: the MSVC toolchain has no <pthread.h>,
+ * so use the same header-only Win32 pthread shim as the other host TUs. The
+ * MinGW CPU build (no DS4_WIN_PTHREAD) keeps real pthreads. See
+ * win/ds4_pthread_win.h and win/README.md. */
+#include "win/ds4_pthread_win.h"
+#else
+#include <pthread.h>
+#endif
 #ifdef _WIN32
 /* Native Windows ROCm build: the same dependency-free POSIX shim used by
  * ds4.c supplies mmap/sysconf/pread/fcntl/flock. <io.h> provides the
